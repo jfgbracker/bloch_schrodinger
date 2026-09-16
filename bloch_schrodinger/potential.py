@@ -1,3 +1,4 @@
+import itertools
 from copy import deepcopy
 
 import matplotlib.pyplot as plt
@@ -8,6 +9,7 @@ from ipywidgets import VBox, interactive_output
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from mpl_toolkits.axes_grid1 import make_axes_locatable
+from scipy.ndimage import gaussian_filter, minimum_filter
 
 from bloch_schrodinger.utils import create_cart_grid, create_sliders
 
@@ -473,11 +475,15 @@ class Potential:
         self.V = self._where_mask(r < 1, method, inverse, value)
 
     def plot(
-        self, 
-        cart_axes: list[int] = [0, 1], 
-        get_cbar:bool = False, 
-        resolution:int|tuple[int] = None,
-        **kwargs
+        self,
+        cart_axes: list[int] = [0, 1],
+        get_cbar: bool = False,
+        resolution: int | tuple[int] = None,
+        show_minima: bool = False,
+        minima_kwargs: dict = {},
+        minima_size: int = 3,
+        minima_mode: str = "wrap",
+        **kwargs,
     ) -> tuple[Figure, Axes] | tuple[Figure, Axes, Axes]:
         """Creates an interactive plot of the potential, with all the parameters as sliders.
         Must be used in an interactive python session, preferably. kwargs are passed to the
@@ -487,6 +493,19 @@ class Potential:
             cart_axes (list[int], optional): The cartesian axes indexes to plot against, with 0 = "x", 1 = "y" and 2 = "z".
             The number of axes given determines the plotting function used, currently only 1d and 2d plots are supported. Defaults to [0,1].
             get_cbar (bool, optional): Whether to return the colorbar for modification. Defaults to False.
+            show_minima (bool, optional): Whether to overlay a scatter of the local minima of the potential,
+            detected with 'find_minima'. Only available when the plot spans the whole space the potential is
+            defined over, i.e. cart_axes == list(range(n_dims)). Defaults to False.
+            minima_kwargs (dict, optional): keyword arguments passed to the scatter function used to plot the
+            minima. Defaults to {}.
+            minima_size (int, optional): the size (in pixels) of the neighborhood used to detect local minima,
+            see 'find_minima'. Defaults to 3.
+            minima_mode (str, optional): boundary handling mode used to detect local minima, see 'find_minima'.
+            Defaults to 'wrap'.
+
+        Raises:
+            ValueError: If the number of cartesian axes to plot against is not 1 or 2, or if 'show_minima' is
+            asked for a plot that only shows a cut through the potential.
         """
         Vtmp = self.V.squeeze()
         self.V = self.V.assign_coords(
@@ -570,6 +589,29 @@ class Potential:
 
             cbar.set_label("Potential")
 
+        if show_minima and list(cart_axes) != list(range(self.n_dims)):
+            # A cut through a higher-dimensional landscape has no reason to contain its minima, so
+            # scattering them onto it would silently draw points that are not on the surface shown.
+            raise ValueError(
+                f"show_minima needs the plot to span the whole space, but cart_axes={cart_axes} "
+                f"only shows a cut of an {self.n_dims}D potential."
+            )
+
+        def minima_offsets(sel):
+            found = self.find_minima(sel, size=minima_size, mode=minima_mode)
+            cart_vals = [np.asarray(f.values).ravel() for f in found[: self.n_dims]]
+            if plot_dim == 1:
+                # A 1D potential is drawn against its value, so that is the second scatter axis.
+                return np.column_stack([cart_vals[0], np.asarray(found[-2].values).ravel()])
+            return np.column_stack([cart_vals[0], cart_vals[1]])
+
+        default_minima_kwargs = dict(color="red", marker="o", s=30)
+        default_minima_kwargs.update(minima_kwargs)
+        scatter = None
+        if show_minima:
+            offsets = minima_offsets(initial_sel)
+            scatter = ax.scatter(offsets[:, 0], offsets[:, 1], **default_minima_kwargs)
+
         def update(**slkwargs):
             sel = {dim: slkwargs[dim] for dim in slider_dims}
 
@@ -595,6 +637,115 @@ class Potential:
                 )
                 # ax.set_title(", ".join([f"{d}={sel[d]:.3f}" for d in sel]))
                 fig.canvas.draw_idle()
+
+            if show_minima:
+                scatter.set_offsets(minima_offsets(sel))
+                fig.canvas.draw_idle()
+
+        out = interactive_output(update, sliders)
+        # Display everything
+        display(VBox(list(sliders.values()) + [out]))
+        if get_cbar:
+            return fig, ax, cbar
+        else:
+            return fig, ax
+
+    def plot_3d(
+        self,
+        get_cbar: bool = False,
+        show_minima: bool = False,
+        minima_kwargs: dict = {},
+        minima_size: int = 3,
+        minima_mode: str = "wrap",
+        **kwargs,
+    ) -> tuple[Figure, Axes] | tuple[Figure, Axes, Axes]:
+        """Creates an interactive 3D surface ('egg carton') plot of a 2D potential, with all the parameters
+        as sliders. Must be used in an interactive python session, preferably a notebook. kwargs are passed
+        to the matplotlib plot_surface function.
+
+        Args:
+            get_cbar (bool, optional): Whether to return the colorbar for modification. Defaults to False.
+            show_minima (bool, optional): Whether to overlay a 3D scatter of the local minima of the
+            potential, detected with 'find_minima'. Defaults to False.
+            minima_kwargs (dict, optional): keyword arguments passed to the scatter function used to plot the
+            minima. Defaults to {}.
+            minima_size (int, optional): the size (in pixels) of the neighborhood used to detect local minima,
+            see 'find_minima'. Defaults to 3.
+            minima_mode (str, optional): boundary handling mode used to detect local minima, see 'find_minima'.
+            Defaults to 'wrap'.
+
+        Raises:
+            ValueError: If the potential is not 2D, since the third axis of the plot is the potential value.
+        """
+        if self.n_dims != 2:
+            raise ValueError(
+                f"plot_3d raises a 2D potential landscape into a surface, got n_dims={self.n_dims}. "
+                "Use 'plot' for a 1D potential, or plotting.plot_isosurface for a 3D field."
+            )
+
+        Vtmp = self.V.squeeze()
+        self.V = self.V.assign_coords(
+            {self.coord_names[i]: self.coords[i] for i in range(self.n_dims)}
+        )
+
+        slider_dims = [dim for dim in Vtmp.dims if dim not in ["a1", "a2"]]
+        sliders = create_sliders(Vtmp, slider_dims, start="mid")
+
+        initial_sel = {dim: sliders[dim].value for dim in slider_dims}
+        potential = Vtmp.sel(initial_sel, method="nearest").transpose("a1", "a2")
+
+        X = np.asarray(self.coords[0].transpose("a1", "a2").data)
+        Y = np.asarray(self.coords[1].transpose("a1", "a2").data)
+
+        surf_kwargs = dict(
+            cmap="viridis", rstride=1, cstride=1, linewidth=0, antialiased=True
+        )
+        surf_kwargs.update(kwargs)
+
+        fig = plt.figure()
+        ax = fig.add_subplot(projection="3d")
+
+        Z = np.real(np.asarray(potential.data))
+        surf = ax.plot_surface(X, Y, Z, **surf_kwargs)
+        ax.set_xlabel(self.coord_names[0])
+        ax.set_ylabel(self.coord_names[1])
+        ax.set_zlabel("Potential")
+
+        cbar = None
+        if get_cbar:
+            cbar = fig.colorbar(surf, ax=ax, shrink=0.6, label="Potential")
+
+        default_minima_kwargs = dict(color="red", marker="o", s=30, depthshade=False)
+        default_minima_kwargs.update(minima_kwargs)
+        scatter = None
+        if show_minima:
+            x_min, y_min, v_min, _ = self.find_minima(
+                initial_sel, size=minima_size, mode=minima_mode
+            )
+            scatter = ax.scatter(
+                x_min.values, y_min.values, v_min.values, **default_minima_kwargs
+            )
+
+        def update(**slkwargs):
+            nonlocal surf, scatter
+            sel = {dim: slkwargs[dim] for dim in slider_dims}
+
+            new_potential = Vtmp.sel(sel, method="nearest").transpose("a1", "a2")
+            Z = np.real(np.asarray(new_potential.data))
+
+            surf.remove()
+            surf = ax.plot_surface(X, Y, Z, **surf_kwargs)
+
+            if show_minima:
+                x_min, y_min, v_min, _ = self.find_minima(
+                    sel, size=minima_size, mode=minima_mode
+                )
+                scatter.remove()
+                scatter = ax.scatter(
+                    x_min.values, y_min.values, v_min.values, **default_minima_kwargs
+                )
+
+            fig.canvas.draw_idle()
 
         out = interactive_output(update, sliders)
         # Display everything
@@ -634,6 +785,165 @@ class Potential:
         new_pot = self.copy()
         new_pot.V = new_pot.V.sel(selection)
         return new_pot
+
+    def smooth(self, *sigmas: float, unit: str = "pixel", mode: str = "wrap"):
+        """Smooth the potential by applying a gaussian filter to it (see scipy.ndimage.gaussian_filter).
+        The smoothing strength can be given in pixels or in units of length along a1, a2, ... .
+
+        Args:
+            *sigmas (float): The smoothing strength, either one value per dimension (in the a1, a2, ...
+            order) or a single value applied to every dimension. A single list/tuple is also accepted.
+            unit (str, optional): Defines the units to use for the smoothing strength. Can be either
+            'pixel' or 'space'. Defaults to 'pixel'.
+            mode (str, optional): How to handle the boundaries, passed to scipy.ndimage.gaussian_filter.
+            'wrap' (the default) is the right choice for a periodic unit cell; anything else lets the cell
+            edges distort the landscape, which is exactly what smoothing before 'find_minima' is meant to
+            avoid. Defaults to 'wrap'.
+
+        Raises:
+            ValueError: If 'unit' is not 'pixel' or 'space', or if the number of strengths given matches
+            neither 1 nor n_dims.
+        """
+        if len(sigmas) == 1 and isinstance(sigmas[0], (list, tuple, np.ndarray)):
+            sigma = [float(s) for s in sigmas[0]]
+        else:
+            sigma = [float(s) for s in sigmas]
+
+        if len(sigma) == 1:
+            sigma = sigma * self.n_dims
+
+        if len(sigma) != self.n_dims:
+            raise ValueError(
+                f"smooth expects 1 or n_dims={self.n_dims} smoothing strengths, got {len(sigma)}"
+            )
+
+        if unit == "space":
+            sigma = [sigma[i] / self.da[i] for i in range(self.n_dims)]
+        elif unit != "pixel":
+            raise ValueError("'unit' must either be 'space' or 'pixel'")
+
+        spatial = [f"a{i + 1}" for i in range(self.n_dims)]
+
+        def _filter(arr):
+            # apply_ufunc hands over the parameter dims in front of the core (spatial) ones. They get
+            # sigma = 0 so that the smoothing never leaks from one parameter value into the next.
+            full_sigma = (0.0,) * (arr.ndim - self.n_dims) + tuple(sigma)
+            return gaussian_filter(arr, sigma=full_sigma, mode=mode)
+
+        # The core dims are the spatial ones, so apply_ufunc loops the filter over the parameter space
+        # instead of broadcasting it, which would smooth across parameter values too.
+        self.V = xr.apply_ufunc(
+            _filter,
+            self.V,
+            input_core_dims=[spatial],
+            output_core_dims=[spatial],
+        )
+
+    def find_minima(
+        self,
+        selection: dict = {},
+        size: int = 3,
+        mode: str = "wrap",
+    ) -> tuple:
+        """Find the local minima of the potential landscape for every value of the remaining (non-spatial)
+        parameter dimensions, using a minimum filter (see scipy.ndimage.minimum_filter). It is usually a good
+        idea to call 'smooth' beforehand to avoid detecting spurious minima caused by numerical noise.
+
+        Args:
+            selection (dict, optional): A selection of some of the non-spatial parameter values (see xarray
+            'sel'), used to reduce the potential before minima are searched. Any parameter dimensions not
+            included here are preserved (as dimensions) in the output. Defaults to {}.
+            size (int, optional): The size (in pixels) of the local neighborhood used to determine minima,
+            the same along every spatial axis. Defaults to 3.
+            mode (str, optional): How to handle the boundaries, passed to scipy.ndimage.minimum_filter. Use
+            'wrap' for periodic lattices (the default), or 'nearest' otherwise. Defaults to 'wrap'.
+
+        Returns:
+            tuple: One DataArray per cartesian coordinate ("x", then "y", then "z", as many as n_dims),
+            followed by a DataArray of the potential value at each minimum, followed by an xr.Dataset with
+            "a1", "a2", ... data variables holding the lattice coordinates of each minimum. In 2D this is the
+            familiar 4-tuple `x, y, v, coords`; in 1D it is `x, v, coords` and in 3D `x, y, z, v, coords`.
+            All of them carry a "minima" dimension in addition to any remaining parameter dimensions of the
+            potential. Since the number of detected minima can vary across parameter values, slices with
+            fewer minima than the maximum found are padded with NaN along "minima". The trailing Dataset can
+            be used to vectorized-select the value of any field defined over the same lattice grid at the
+            minima positions, e.g. `field.sel(a1=coords.a1, a2=coords.a2, method="nearest")`.
+            A slice that is exactly flat (e.g. depth == 0) has no well-defined minimum and contributes
+            zero minima rather than every pixel.
+        """
+        spatial = [f"a{i + 1}" for i in range(self.n_dims)]
+        cart = [self.coord_names[i] for i in range(self.n_dims)]
+
+        # Make sure the cartesian coordinates are attached, the way 'plot' does, so that a potential that
+        # went through 'add'/'multiply'/'set' still reports positions rather than raising.
+        V = self.V.assign_coords({cart[i]: self.coords[i] for i in range(self.n_dims)})
+        Vsel = V.sel(selection, method="nearest") if selection else V
+
+        param_dims = [d for d in Vsel.dims if d not in spatial]
+        param_coords = {
+            d: (
+                np.asarray(Vsel.coords[d].values)
+                if d in Vsel.coords
+                else np.arange(Vsel.sizes[d])
+            )
+            for d in param_dims
+        }
+        shape = tuple(len(param_coords[d]) for d in param_dims)
+
+        per_slice = {}
+        max_count = 0
+        for idx in itertools.product(*(range(n) for n in shape)):
+            Vslice = Vsel.isel({d: i for d, i in zip(param_dims, idx)}).transpose(*spatial)
+
+            data = np.real(np.asarray(Vslice.data))
+            if np.ptp(data) == 0:
+                # Flat landscape (e.g. depth == 0): every pixel trivially satisfies the minimum-filter
+                # equality, which would otherwise blow up "minima" to the full grid size for this slice
+                # (and, via padding, for every other slice too). Report no minima instead.
+                minima_mask = np.zeros_like(data, dtype=bool)
+            else:
+                minima_mask = data == minimum_filter(data, size=size, mode=mode)
+
+            lattice_grids = np.meshgrid(
+                *[np.asarray(Vslice.coords[d].values) for d in spatial], indexing="ij"
+            )
+
+            per_slice[idx] = (
+                [
+                    np.asarray(Vslice.coords[c].transpose(*spatial).data)[minima_mask]
+                    for c in cart
+                ],
+                data[minima_mask],
+                [g[minima_mask] for g in lattice_grids],
+            )
+            max_count = max(max_count, int(minima_mask.sum()))
+
+        cart_arrs = [np.full(shape + (max_count,), np.nan) for _ in cart]
+        v_arr = np.full(shape + (max_count,), np.nan)
+        lattice_arrs = [np.full(shape + (max_count,), np.nan) for _ in spatial]
+
+        for idx, (cart_min, v_min, lattice_min) in per_slice.items():
+            n = len(v_min)
+            sl = idx + (slice(0, n),)
+            for i in range(self.n_dims):
+                cart_arrs[i][sl] = cart_min[i]
+                lattice_arrs[i][sl] = lattice_min[i]
+            v_arr[sl] = v_min
+
+        dims = param_dims + ["minima"]
+        coords = {**param_coords, "minima": np.arange(max_count)}
+
+        cart_das = [
+            xr.DataArray(cart_arrs[i], dims=dims, coords=coords, name=f"{cart[i]}_min")
+            for i in range(self.n_dims)
+        ]
+        v_da = xr.DataArray(v_arr, dims=dims, coords=coords, name="v_min")
+        minima_coords = xr.Dataset(
+            {spatial[i]: (dims, lattice_arrs[i]) for i in range(self.n_dims)},
+            coords=coords,
+        )
+
+        return (*cart_das, v_da, minima_coords)
 
     def coarsen(self, factor: tuple[int]) -> "Potential":
         """Return a coarsened copy of the Potential, with reduced resolution along all axes.
