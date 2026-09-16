@@ -101,6 +101,16 @@ class Wannier:
         ]
 
         self.maxsearch = min(min(self.nb) // 2 - 2, 10)
+        if self.maxsearch < 1:
+            # Without this the failure surfaces deep inside compute_stencil as an
+            # "index 0 is out of bounds for axis 0 with size 0", because no shell of
+            # neighbouring k-points is found to build the finite-difference stencil on.
+            raise ValueError(
+                f"resolution={tuple(self.nb)} is too coarse to build the k-space finite "
+                "difference stencil: the search radius is min(min(resolution)//2 - 2, 10) "
+                f"= {self.maxsearch}, which must be at least 1. Use at least 6 k-points "
+                "along every axis (8 or more in practice for a usable stencil)."
+            )
         self.compute_stencil()
 
 
