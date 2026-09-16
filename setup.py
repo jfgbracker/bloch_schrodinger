@@ -17,7 +17,7 @@ DESCRIPTION = 'A solver for the 1D/2D/3D Bloch-Schrödinger equation, with finit
 URL = 'https://github.com/me/myproject'
 EMAIL = 'guillotmartin@yahoo.com'
 AUTHOR = 'Martin Guillot'
-REQUIRES_PYTHON = '>=3.14.0'
+REQUIRES_PYTHON = '>=3.11'
 VERSION = '0.1.0'
     
 # What packages are required for this module to be executed?
@@ -138,6 +138,9 @@ setup(
         'License :: OSI Approved :: MIT License',
         'Programming Language :: Python',
         'Programming Language :: Python :: 3',
+        'Programming Language :: Python :: 3.11',
+        'Programming Language :: Python :: 3.12',
+        'Programming Language :: Python :: 3.13',
         'Programming Language :: Python :: 3.14',
         'Programming Language :: Python :: Implementation :: CPython',
         'Programming Language :: Python :: Implementation :: PyPy'

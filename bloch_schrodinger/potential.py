@@ -1082,7 +1082,7 @@ class Potential:
         return tiled
 
 
-type paramType = int | float | xr.DataArray
+paramType = int | float | xr.DataArray
 
 
 def optical_honeycomb(

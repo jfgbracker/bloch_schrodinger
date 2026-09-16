@@ -21,6 +21,42 @@ The published method factorises the pair problem per lattice direction, so it co
 Units are handled by `UnitConverter`, which maps between this package's `H = alpha k^2 + V` and the solver's `m = hbar = d = 1`. The conversion is pinned by `tests/test_hubbard.py`, whose load-bearing test states one physical problem in four different unit conventions and requires the same `U/E_rec` from all of them.
 
 
+## This fork
+
+This is a fork of [GuillotMartin/bloch_schrodinger](https://github.com/GuillotMartin/bloch_schrodinger)
+carrying three things that are not (yet) upstream:
+
+1. **`bloch_schrodinger.hubbard`** — the exact Hubbard `U`, described above.
+2. **`Potential.find_minima()`, `Potential.smooth()`, `Potential.plot_3d()`**, and
+   `Potential.plot(show_minima=…)` — helpers for locating and displaying the sites of a
+   lattice. `find_minima()` returns one array per cartesian coordinate, then the potential
+   value, then a `Dataset` of lattice coordinates, so the 2D call reads
+   `x, y, v, coords = pot.find_minima()`.
+3. **A Python 3.11 floor** instead of 3.12+ — see below.
+
+Upstream is tracked as the `upstream` remote; `git pull --rebase upstream main` brings in
+new work from there.
+
+## Python version
+
+`REQUIRES_PYTHON = '>=3.11'`, and every source file in the package parses under 3.11.
+
+Upstream declares 3.12+, but nothing in the package needs it: the only 3.12-only construct
+was a handful of [PEP 695](https://peps.python.org/pep-0695/) type-alias statements,
+
+```python
+type paramType = int | float | xr.DataArray     # SyntaxError on 3.11
+```
+
+which are used purely as annotations. Dropping the `type` keyword leaves a plain
+assignment that behaves identically here — PEP 695 aliases are lazily evaluated and plain
+assignments are eager, but no right-hand side forward-references a name defined later, so
+eager evaluation is safe. There are no 3.12-only stdlib APIs anywhere in the package.
+
+This matters because compute clusters usually lag several Python releases behind. Keeping
+the floor at 3.11 means the same commit runs on the cluster and on a current desktop, with
+no patch step in between.
+
 ## Installation
 
 First download the repository and extract it where you want. Then, run in your python environment 
