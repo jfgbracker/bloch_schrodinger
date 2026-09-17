@@ -33,6 +33,11 @@ carrying three things that are not (yet) upstream:
    value, then a `Dataset` of lattice coordinates, so the 2D call reads
    `x, y, v, coords = pot.find_minima()`.
 3. **A Python 3.11 floor** instead of 3.12+ — see below.
+4. **Lazy `plotly` / `scikit-image` imports.** Both are needed only by `plot_isosurface`,
+   but importing them at module scope made `bloch_schrodinger.plotting` unimportable
+   without them — a real cost on a compute node where neither is installed. They are now
+   imported inside the functions that use them; `plot_isosurface` raises a plain
+   `ImportError` if they are missing, and everything else in the module works.
 
 Upstream is tracked as the `upstream` remote; `git pull --rebase upstream main` brings in
 new work from there.

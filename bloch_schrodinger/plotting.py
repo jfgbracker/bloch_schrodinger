@@ -7,7 +7,6 @@ import matplotlib.pyplot as plt
 import json
 
 import numpy as np
-import plotly.graph_objects as go
 import xarray as xr
 from cmcrameri import cm
 from IPython.display import display
@@ -17,7 +16,6 @@ from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
 from mpl_toolkits.axes_grid1 import make_axes_locatable
-from skimage.measure import marching_cubes
 
 from bloch_schrodinger.potential import Potential
 from bloch_schrodinger.utils import (
@@ -1404,6 +1402,11 @@ def _isosurface_mesh(
         (n_faces, 3) vertex indices, and the (n_vertices,) intensities. All three are empty if the
         level lies outside the field's range, which leaves plotly drawing nothing.
     """
+    # Imported here, not at module scope: scikit-image is only needed for the isosurface
+    # path, and an eager import makes the whole plotting module unimportable without it --
+    # which is a real cost on a compute node where it is not installed.
+    from skimage.measure import marching_cubes
+
     values = field.transpose("x", "y", "z").values
     # The orthogonal grid is a bounding box, so its corners fall outside the lattice and are NaN.
     # marching_cubes cannot handle those, and they would poison every cell they touch: push them
@@ -1441,7 +1444,7 @@ def plot_isosurface(
     resolution: int|tuple[int] = None,
     cst_bds: bool = True,
     layout: dict = {},
-) -> go.FigureWidget:
+) -> "go.FigureWidget":
     """Render a 3D mode as an interactive plotly isosurface, with the surface's shape and its color
     driven by two independent fields: 'volume' sets where the surface sits, 'color' is painted onto it.
     The archetypal use is a complex eigenvector, whose modulus gives the shape and whose phase gives
@@ -1500,6 +1503,10 @@ def plot_isosurface(
     Raises:
         ValueError: If 'volume' isn't 3D, or if either field is complex.
     """
+    # As with marching_cubes above: plotly is needed by this function alone, so importing it
+    # here keeps the rest of the module usable without it.
+    import plotly.graph_objects as go
+
     spatial_dims = _spatial_dims(volume)
     if len(spatial_dims) != 3:
         raise ValueError(
