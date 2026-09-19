@@ -726,7 +726,7 @@ def dashboard(
     eigvadim: str,
     eigveplots: list[list[NoneType | xr.DataArray]],
     potential: Potential,
-    template: str | dict,
+    template: str | dict | tuple[str | dict],
     titles: NoneType | list[list[NoneType | str]] = None,
     eigvawidth: int = 0.3,
     figkw: dict = {},
@@ -744,7 +744,10 @@ def dashboard(
         eigveplots (list[list[Union[NoneType,xr.DataArray]]]): A matrix representing the plot structure.
         The figure will consist of a panel showing the eigenvalues, and beside it an array of pcolormeshes with the structure specified by this matrix
         potential (Potential): The potential for the contour overlay, only one needs to be given.
-        template (Union[str,dict]): A template to use for the colormesh, see doc of 'plot_eigenvector' and 'get_template' for more infos.
+        template (Union[str, dict, tuple]): The style of the eigenvector maps, shared by all of them. Either a preset name
+        (see 'cmesh_tmpl') or a colormesh template dict, both drawn with the default 'contour_tmpl()' overlay, or a tuple
+        (colormesh, contour) to style the potential contours as well. See 'create_map' for the keys of a template.
+        The maps never get a colorbar, whatever the template says.
         titles (Union[NoneType, list[list[Union[NoneType,str]]]], optional): The titles, either a matrix with the same shape as plot_matrix, or None. Defaults to None.
         eigvawidth (int, optional): The fraction of the plot taken by the eigenvalue structure. Defaults to 0.3.
         figkw (dict, optional): A dictionary to pass to the figure constructor. Defaults to {}.
@@ -784,12 +787,12 @@ def dashboard(
         """Check wheter template is a string or a dict, and if a str, create the proper dictionnary."""
         return template if isinstance(template, dict) else cmesh_tmpl(template)
 
-    def format_template(template: tuple[str | dict]) -> tuple[dict, dict]:
+    def format_template(template: str | dict | tuple[str | dict]) -> tuple[dict, dict]:
         """Format a template input into the proper tuple"""
-        if isinstance(template, str):
-            template = (cmesh_tmpl(template), contour_tmpl())
+        if isinstance(template, (str, dict)):
+            template = (make_tmpl(template), contour_tmpl())
         elif not isinstance(template, tuple):
-            raise ValueError("Each template entry must either be a tuple or a string")
+            raise ValueError("The template must be a string, a dict or a tuple")
         elif len(template) == 1:
             ctmpl = make_tmpl(template[0])
             template = (ctmpl, contour_tmpl())
@@ -805,18 +808,19 @@ def dashboard(
             if eigveplots[i][j] is not None:
                 plot = eigveplots[i][j]
 
-                ctempl = template[0]
-                ctempl["colorbar"] = None
+                # The maps get no colorbar. Copied, so that the caller's own template is left untouched
+                ctempl = {**template[0], "colorbar": None}
 
+                # The templates are passed by name: positionally, they would land in 'resolution'
                 ax = fig.add_subplot(gs_eigenvectors[i, j])
                 slider_ax, up, ax = create_map(
-                    fig, ax, cart_axes, plot, "pcolormesh", ctempl
+                    fig, ax, cart_axes, plot, "pcolormesh", template=ctempl
                 )
                 sliders.update(slider_ax)
                 funcs += [up]
 
                 slider_ax, up, ax = create_map(
-                    fig, ax, cart_axes, potential.V, "contour", template[1]
+                    fig, ax, cart_axes, potential.V, "contour", template=template[1]
                 )
                 sliders.update(slider_ax)
                 funcs += [up]
