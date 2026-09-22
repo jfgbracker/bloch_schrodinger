@@ -10,8 +10,77 @@ from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from scipy.ndimage import gaussian_filter, minimum_filter
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
+from scipy.spatial import cKDTree
 
 from bloch_schrodinger.utils import create_cart_grid, create_sliders
+
+
+def _merge_tied_minima(
+    mask: np.ndarray, leaky: np.ndarray, size: int, periodic: bool
+) -> tuple[np.ndarray, np.ndarray]:
+    """Group the pixels flagged by a minimum filter into distinct minima, one mean index per group.
+
+    A pixel is flagged when it equals the minimum of its window, so a minimum that falls between grid
+    points -- which it does for any symmetric well on a grid of even resolution -- flags two or more
+    pixels of exactly equal value, and a flat bottom flags all of its pixels. Two flagged pixels in each
+    other's window are necessarily equal, and belong to the same minimum: they are grouped, chaining
+    through the window, and each group is reported at its mean index. That is the symmetric center of a
+    tie, which is where the minimum really is.
+
+    A flat region that is not a minimum -- a flat wall next to lower ground, say -- has its inner pixels
+    flagged too, since each of them equals the minimum of its own window. What gives it away is that
+    some pixel of the same value, nearer the lower ground, is not flagged: a group with a member marked
+    'leaky' is dropped.
+
+    Args:
+        mask (np.ndarray): The flagged pixels.
+        leaky (np.ndarray): The flagged pixels with an unflagged pixel of the same value in their window.
+        size (int): The size of the filter window, whose half-width is the grouping distance.
+        periodic (bool): Whether the grid wraps around, as with the 'wrap' filter mode, in which case
+        pixels on opposite edges are neighbours.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]: For each minimum, its mean (float) index, which can lie between grid
+        points and, on a periodic grid, is folded back into [-0.5, n - 0.5) along each axis; and the
+        (integer) index of one of its pixels, where its value can be read. Both are (n_minima, n_dims).
+    """
+    points = np.argwhere(mask)
+    if len(points) == 0:
+        return np.empty((0, mask.ndim)), np.empty((0, mask.ndim), dtype=int)
+
+    shape = np.array(mask.shape)
+    tree = cKDTree(points, boxsize=shape if periodic else None)
+    pairs = tree.query_pairs(r=max(size // 2, 1), p=np.inf, output_type="ndarray")
+    n = len(points)
+    graph = coo_matrix((np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])), shape=(n, n))
+    n_groups, labels = connected_components(graph, directed=False)
+
+    centers, representatives = [], []
+    for g in range(n_groups):
+        members = points[labels == g]
+        if leaky[tuple(members.T)].any():
+            continue
+        representatives.append(members[0])
+        members = members.astype(float)
+        if periodic:
+            # A group straddling an edge must average to the edge rather than to the middle of the cell.
+            # Along each axis, the period is cut open at the widest gap between the occupied indices,
+            # which is outside the group however wide it is.
+            for i, n_i in enumerate(shape):
+                occupied = np.unique(members[:, i])
+                gaps = np.diff(np.append(occupied, occupied[0] + n_i))
+                start = occupied[(np.argmax(gaps) + 1) % len(occupied)]
+                members[:, i] = start + (members[:, i] - start) % n_i
+        center = members.mean(axis=0)
+        if periodic:
+            center = (center + 0.5) % shape - 0.5
+        centers.append(center)
+    return (
+        np.array(centers).reshape(-1, mask.ndim),
+        np.array(representatives, dtype=int).reshape(-1, mask.ndim),
+    )
 
 
 def create_parameter(name: str, data: list | np.ndarray) -> xr.DataArray:
@@ -870,6 +939,11 @@ class Potential:
             minima positions, e.g. `field.sel(a1=coords.a1, a2=coords.a2, method="nearest")`.
             A slice that is exactly flat (e.g. depth == 0) has no well-defined minimum and contributes
             zero minima rather than every pixel.
+
+            Pixels of equal value within each other's neighborhood are reported as a single minimum,
+            placed at their mean position. This happens whenever a minimum falls between grid points, as a
+            symmetric well does on a grid of even resolution, or when it has a flat bottom. The position
+            of such a minimum lies between grid points, while its value is the one shared by its pixels.
         """
         spatial = [f"a{i + 1}" for i in range(self.n_dims)]
         cart = [self.coord_names[i] for i in range(self.n_dims)]
@@ -904,19 +978,33 @@ class Potential:
             else:
                 minima_mask = data == minimum_filter(data, size=size, mode=mode)
 
-            lattice_grids = np.meshgrid(
-                *[np.asarray(Vslice.coords[d].values) for d in spatial], indexing="ij"
+            # The window of a flagged pixel holds nothing lower than it, so an unflagged pixel of the same
+            # value in it means a flat region that goes down further on: not a minimum
+            leaky = minima_mask & (
+                minimum_filter(np.where(minima_mask, np.inf, data), size=size, mode=mode)
+                == data
+            )
+            # Tied pixels -- a minimum falling between grid points, or a flat bottom -- are one minimum
+            centers, members = _merge_tied_minima(
+                minima_mask, leaky, size, periodic=(mode == "wrap")
             )
 
-            per_slice[idx] = (
-                [
-                    np.asarray(Vslice.coords[c].transpose(*spatial).data)[minima_mask]
-                    for c in cart
-                ],
-                data[minima_mask],
-                [g[minima_mask] for g in lattice_grids],
-            )
-            max_count = max(max_count, int(minima_mask.sum()))
+            # The lattice coordinates are evenly spaced, so a fractional index maps onto them linearly
+            lattice_min = []
+            for i, d in enumerate(spatial):
+                line = np.asarray(Vslice.coords[d].values, dtype=float)
+                step = line[1] - line[0] if len(line) > 1 else 0.0
+                lattice_min.append(line[0] + centers[:, i] * step)
+            # Cartesian coordinate i = sum over lattice coords weighted by unit vector components
+            cart_min = [
+                sum(self.a[j, i] * lattice_min[j] for j in range(self.n_dims))
+                for i in range(self.n_dims)
+            ]
+            # All the pixels of a group hold the same value, so any of them gives it
+            v_min = data[tuple(members.T)]
+
+            per_slice[idx] = (cart_min, v_min, lattice_min)
+            max_count = max(max_count, len(centers))
 
         cart_arrs = [np.full(shape + (max_count,), np.nan) for _ in cart]
         v_arr = np.full(shape + (max_count,), np.nan)

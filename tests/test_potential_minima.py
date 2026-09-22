@@ -21,9 +21,9 @@ L = 4.0
 def single_well_1d(resolution=33):
     """-cos(2 pi x / L) over one cell: one minimum, at x = 0.
 
-    An odd resolution is deliberate. The spatial grid is a half-pixel-offset linspace, so x = 0 is a
-    grid point only for an odd number of points; with an even one the minimum falls between two
-    pixels and is reported twice, which says nothing about the code under test.
+    The spatial grid is a half-pixel-offset linspace, so x = 0 is a grid point only for an odd number
+    of points. With an even one the minimum falls between two pixels of equal value, a case tested on
+    its own below.
     """
     p = Potential(unitvecs=[[L]], resolution=(resolution,), v0=0)
     p.set(-np.cos(2 * np.pi * p.x / L))
@@ -141,6 +141,160 @@ def test_the_two_boundary_modes_disagree_on_an_edge_minimum():
 
 
 # --------------------------------------------------------------------------------------
+# find_minima: minima falling between grid points
+# --------------------------------------------------------------------------------------
+
+
+def count(found):
+    return int(np.isfinite(found[0]).sum())
+
+
+@pytest.mark.parametrize("resolution", [32, 33])
+def test_a_well_between_two_pixels_is_one_minimum_at_its_center_in_1d(resolution):
+    """With an even resolution, x = 0 falls between two pixels of exactly equal value."""
+    x, v, coords = single_well_1d(resolution).find_minima()
+
+    assert x.shape == (1,)
+    assert np.allclose(x.values, 0.0)
+    assert np.allclose(coords.a1.values, 0.0)
+    # Between two pixels, the value is the one they share, not the true (lower) minimum between them
+    expected = -np.cos(np.pi / resolution) if resolution % 2 == 0 else -1.0
+    assert np.allclose(v.values, expected)
+
+
+@pytest.mark.parametrize("resolution", [(32, 32), (32, 33), (33, 32)])
+def test_a_well_between_pixels_is_one_minimum_at_its_center_in_2d(resolution):
+    """Between 2 or 4 pixels, depending on how many axes have an even resolution."""
+    x, y, v, _ = single_well_2d(resolution).find_minima()
+
+    assert x.shape == (1,)
+    assert np.allclose([x.values, y.values], 0.0)
+
+
+def test_a_well_between_pixels_is_one_minimum_at_its_center_in_3d():
+    p = Potential(unitvecs=np.eye(3).tolist(), resolution=(8, 8, 8), v0=0)
+    p.set(-np.cos(2 * np.pi * p.x) - np.cos(2 * np.pi * p.y) - np.cos(2 * np.pi * p.z))
+
+    x, y, z, v, _ = p.find_minima()
+
+    assert x.shape == (1,)
+    assert np.allclose([x.values, y.values, z.values], 0.0)
+
+
+@pytest.mark.parametrize("resolution", [(48, 48), (64, 64), (50, 50), (100, 100)])
+def test_honeycomb_has_exactly_one_minimum_per_site(resolution):
+    """The reported bug: at some resolutions, every site of the honeycomb was found twice."""
+    s = create_parameter("s", [4.0, 12.0])
+    delta = create_parameter("delta", [-0.5, 0.0, 0.5])
+    _, p = optical_honeycomb(wavelength=1.064, s1=s + delta, s2=s - delta, resolution=resolution)
+
+    x, y, v, _ = p.find_minima()
+
+    assert np.all(np.isfinite(x).sum("minima") == 2)
+    # And the two are the two different sites, not the same one twice
+    gap = np.hypot(x.isel(minima=0) - x.isel(minima=1), y.isel(minima=0) - y.isel(minima=1))
+    assert float(gap.min()) > 10 * p.da[0]
+
+
+@pytest.mark.parametrize("resolution", [32, 33])
+def test_a_minimum_on_the_edge_of_a_periodic_cell_is_found_once(resolution):
+    """With 'wrap', the pixels on either side of the cell edge are neighbours, so a minimum on the edge
+    ties them, and must be reported once, on the edge, rather than at the middle of the cell."""
+    p = Potential(unitvecs=[[L]], resolution=(resolution,), v0=0)
+    p.set(np.cos(2 * np.pi * p.x / L))  # minimum at x = -L/2, equivalently L/2
+
+    x, v, _ = p.find_minima(mode="wrap")
+
+    assert x.shape == (1,)
+    assert np.isclose(abs(x.item()), L / 2, atol=L / resolution / 2 + 1e-12)
+    assert np.isclose(v.item(), float(p.V.min()))
+
+
+def test_a_flat_bottom_is_one_minimum_at_its_center():
+    p = Potential(unitvecs=[[L, 0], [0, L]], resolution=(40, 40), v0=10)
+    p.circle(center=(0.3, -0.2), radius=1.0, value=0)
+
+    x, y, v, _ = p.find_minima(mode="nearest")
+
+    assert x.shape == (1,)
+    assert np.allclose([x.item(), y.item()], [0.3, -0.2], atol=p.da[0])
+    assert v.item() == 0
+
+
+@pytest.mark.parametrize("center", [(0.0, 0.0), (0.2, 0.1)])
+def test_a_wide_flat_bottom_on_a_periodic_skewed_cell_is_found_at_its_center(center):
+    """The disk spans most of the cell along both lattice axes, so its pixels are further apart than
+    half a period: averaging them must not fold part of it over to the other side of the cell."""
+    p = Potential(unitvecs=[[2, -2], [2, 2]], resolution=(100, 100), v0=100)
+    p.circle(center=center, radius=1, value=0)
+
+    x, y, v, _ = p.find_minima(mode="wrap")
+
+    assert x.shape == (1,)
+    assert np.allclose([x.item(), y.item()], center, atol=p.da[0])
+
+
+def test_a_flat_bottom_across_the_periodic_edge_is_found_on_the_edge():
+    """A disk centered on the cell edge, drawn periodically from its two images: its pixels sit on
+    opposite sides of the cell, and must average to the edge, not to the middle of the cell."""
+    a1, a2 = np.array([2.0, -2.0]), np.array([2.0, 2.0])
+    p = Potential(unitvecs=[a1, a2], resolution=(100, 100), v0=100)
+    for image in (a1 / 2, -a1 / 2):
+        p.circle(center=tuple(image), radius=0.8, value=0)
+
+    x, y, v, coords = p.find_minima(mode="wrap")
+
+    assert x.shape == (1,)
+    # On the edge a1 = +-1/2, halfway along a2, whichever of the two images is reported
+    assert np.isclose(abs(coords.a1.item()), 0.5, atol=0.01)
+    assert np.isclose(coords.a2.item(), 0.0, atol=0.01)
+    assert np.isclose(np.hypot(x.item(), y.item()), np.linalg.norm(a1) / 2, atol=p.da[0])
+
+
+def test_a_flat_wall_is_not_a_minimum():
+    """Inside a flat wall, every pixel equals the minimum of its own window, yet the wall is no
+    minimum: it goes down into the well. Only the well may be reported."""
+    p = Potential(unitvecs=[[L, 0], [0, L]], resolution=(40, 40), v0=10)
+    p.circle(center=(0, 0), radius=1.0, value=((p.x**2 + p.y**2) - 1))
+
+    x, y, v, _ = p.find_minima(mode="wrap")
+
+    assert x.shape == (1,)
+    assert np.allclose([x.item(), y.item()], 0.0, atol=p.da[0])
+    assert v.item() < 0
+
+
+def test_distinct_wells_of_equal_depth_are_not_merged():
+    """Merging only concerns pixels in each other's neighborhood, never two separate wells."""
+    p = Potential(unitvecs=[[L, 0], [0, L]], resolution=(32, 32), v0=0)
+    p.set(-np.cos(4 * np.pi * p.x / L) - np.cos(2 * np.pi * p.y / L))  # two wells, at x = -L/2 (the cell edge) and 0
+
+    x, y, v, _ = p.find_minima()
+
+    assert np.allclose(np.sort(x.values), [-L / 2, 0.0])
+    assert np.allclose(y.values, 0.0)
+    assert np.allclose(v.values, v.values[0])
+
+
+@pytest.mark.parametrize("size, expected", [(3, 2), (5, 1)])
+def test_ties_are_merged_within_the_filter_window(size, expected):
+    """Two equal pixels two apart are separate minima for a 3-pixel window, but one for a 5-pixel
+    window, whose neighborhood contains both. The merged one sits halfway between them."""
+    p = Potential(unitvecs=[[L]], resolution=(16,), v0=0)
+    values = np.ones(16)
+    values[[6, 8]] = 0.0
+    values[7] = 0.5
+    p.V = p.V.copy(data=values)
+
+    x, v, coords = p.find_minima(size=size, mode="nearest")
+
+    assert count((x,)) == expected
+    assert np.allclose(v.values, 0.0)
+    if expected == 1:
+        assert np.isclose(coords.a1.item(), float(p.V.a1[7]))
+
+
+# --------------------------------------------------------------------------------------
 # smooth
 # --------------------------------------------------------------------------------------
 
@@ -213,6 +367,16 @@ def test_plot_overlays_the_minima():
     _, ax_minima = p.plot(show_minima=True)
 
     assert len(ax_minima.collections) == len(ax_plain.collections) + 1
+
+
+def test_plot_marks_each_honeycomb_site_once():
+    _, p = optical_honeycomb(wavelength=1.064, s1=4.0, s2=4.0, resolution=(48, 48))
+
+    _, ax_plain = p.plot()
+    _, ax = p.plot(show_minima=True)
+
+    (scatter,) = ax.collections[len(ax_plain.collections):]
+    assert len(scatter.get_offsets()) == 2
 
 
 def test_plot_3d_runs_and_can_overlay_the_minima():
