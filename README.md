@@ -24,7 +24,7 @@ Units are handled by `UnitConverter`, which maps between this package's `H = alp
 ## This fork
 
 This is a fork of [GuillotMartin/bloch_schrodinger](https://github.com/GuillotMartin/bloch_schrodinger)
-carrying three things that are not (yet) upstream:
+carrying these things that are not (yet) upstream:
 
 1. **`bloch_schrodinger.hubbard`** — the exact Hubbard `U`, described above.
 2. **`Potential.find_minima()`, `Potential.smooth()`, `Potential.plot_3d()`**, and
@@ -38,6 +38,11 @@ carrying three things that are not (yet) upstream:
    without them — a real cost on a compute node where neither is installed. They are now
    imported inside the functions that use them; `plot_isosurface` raises a plain
    `ImportError` if they are missing, and everything else in the module works.
+5. **`Wannier` trial projections that honour their centres.** `guess` projects onto the full
+   Bloch function, with its phase and the Gaussian's periodic images, so a centre selects the
+   cell as well as the orbital; before, a Wannier function landed on whichever periodic image
+   the gauge favoured. `Wannier.solve` also accepts per-parameter-point `centers` (a DataArray
+   with dims `("n", "coord", ...)`), for lattices whose sites move across parameter space.
 
 Upstream is tracked as the `upstream` remote; `git pull --rebase upstream main` brings in
 new work from there.

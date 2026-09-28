@@ -227,3 +227,47 @@ def test_isosurface_cyclic_colour_does_not_tear_at_the_seam(cyclic, tolerance):
     else:
         # Without the unit-circle detour the seam inverts the phase outright
         assert err.max() > 2.0
+
+
+# --------------------------------------------------------------------------------------
+# Where the Wannier functions end up
+# --------------------------------------------------------------------------------------
+
+
+def _centre_1d(wf):
+    density = np.abs(wf) ** 2
+    return float((density * wf.x).sum("a1") / density.sum("a1"))
+
+
+@pytest.mark.parametrize("cell", [-1, 0, 1])
+def test_centre_places_the_wannier_function_in_the_seeded_cell(cell):
+    """Regression: the trial projection left out the Bloch phase, so the centre picked an orbital
+    but not a cell -- every seed a lattice vector apart gave the same Wannier function."""
+    pot = cosine_1d()
+    w = Wannier(pot, 0.5, [np.array([2 * np.pi / L])], (9,), method="pw")
+    U = w.solve(n_wannier=1, centers=[[cell * L]], blockwargs={"E_lim": 150}, seed=3,
+                verbose=False)
+    _, wf = w.compute_wannier(U_mnk=U, bounds=[(-2, 3)], verbose=False)
+    assert _centre_1d(wf.isel(n=0)) == pytest.approx(cell * L, abs=0.05 * L)
+
+
+def test_centers_may_vary_over_parameter_space():
+    pot = cosine_1d()
+    depth = xr.DataArray([10.0, 20.0], dims="depth", coords={"depth": [10.0, 20.0]})
+    pot.set(-depth * np.cos(2 * np.pi * pot.coords[0] / L))
+    w = Wannier(pot, 0.5, [np.array([2 * np.pi / L])], (9,), method="pw")
+    centers = xr.DataArray([[[0.0]], [[L]]], dims=("depth", "n", "coord"),
+                           coords={"depth": [10.0, 20.0]})
+    U = w.solve(n_wannier=1, centers=centers, blockwargs={"E_lim": 150}, seed=3,
+                verbose=False)
+    _, wf = w.compute_wannier(U_mnk=U, bounds=[(-2, 3)], verbose=False)
+    assert _centre_1d(wf.sel(depth=10.0).isel(n=0)) == pytest.approx(0.0, abs=0.05 * L)
+    assert _centre_1d(wf.sel(depth=20.0).isel(n=0)) == pytest.approx(L, abs=0.05 * L)
+
+
+def test_centers_with_an_unknown_dim_are_rejected():
+    pot = cosine_1d()
+    w = Wannier(pot, 0.5, [np.array([2 * np.pi / L])], (9,), method="pw")
+    centers = xr.DataArray([[[0.0]]], dims=("theta", "n", "coord"))
+    with pytest.raises(ValueError, match="parameter dims"):
+        w.solve(n_wannier=1, centers=centers, blockwargs={"E_lim": 150}, verbose=False)

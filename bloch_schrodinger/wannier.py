@@ -354,22 +354,37 @@ class Wannier:
 
         sigma = self.potential.a[0]@self.potential.a[0] / 10 # A reasonable spread
 
-        g_n = xr.DataArray(
-            np.zeros((self.nbands, *[u_mk.sizes[d] for d in self.spatial_dims])),
-            coords = {
-                'n': np.arange(self.n_wannier[0], self.n_wannier[1]),
-                **{d: u_mk.coords[d] for d in self.spatial_dims},
-            }
-        )
-
+        # The projection has to be onto the full Bloch function, psi_k = exp(-i k.r) u_k (the
+        # convention compute_wannier assembles with), not onto u_k alone:
+        #
+        #     A_mnk = <psi_mk | g_n> = sum_R sum_{r in cell} exp(i k.(r+R)) u*_mk(r) g_n(r+R)
+        #
+        # Without the Bloch phase the trial function only selects an orbital, never a cell: the
+        # resulting Wannier function lands on whichever periodic image of that orbital the gauge
+        # happens to favour, and two trial functions a lattice vector apart are indistinguishable.
+        # Without the images, a centre near the cell boundary is a truncated Gaussian. Both made
+        # `centers` a weak hint rather than the placement it is documented to be.
+        r_cell = [u_mk.coords[name] for name in self.coord_names]
+        k_cart = self.k
+        images = list(itertools.product(range(-2, 3), repeat=self.n_dims))
+        g_n = []
         for i in range(self.nbands):
-            r2 = sum(
-                (u_mk.coords[name] - centers[i][c]) ** 2
-                for c, name in enumerate(self.coord_names)
-            )
-            gauss = np.exp(-r2 / 2 / (sigma*draw(0.5, 2))**2)
-            gauss /= (gauss**2).sum(self.spatial_dims)
-            g_n[{'n':i}] = gauss.transpose(*self.spatial_dims)
+            width = sigma * draw(0.5, 2)
+            g_k = 0
+            norm = 0
+            for R_idx in images:
+                R = sum(R_idx[j] * self.potential.a[j] for j in range(self.n_dims))
+                r2 = sum(
+                    (r_cell[c] + R[c] - centers[i][c]) ** 2 for c in range(self.n_dims)
+                )
+                gauss = np.exp(-r2 / 2 / width**2)
+                norm = norm + (gauss**2).sum(self.spatial_dims)
+                k_dot_r = sum(k_cart[c] * (r_cell[c] + R[c]) for c in range(self.n_dims))
+                g_k = g_k + np.exp(1j * k_dot_r) * gauss
+            g_n.append(g_k / norm**0.5)
+        g_n = xr.concat(g_n, dim="n").assign_coords(
+            n=np.arange(self.n_wannier[0], self.n_wannier[1])
+        )
 
         # Now performing a lödwin decomposition
         A_mnk = (u_mk.conjugate() * g_n).sum(self.spatial_dims)
@@ -585,7 +600,10 @@ class Wannier:
         Args:
             n_wannier (int, tuple[int, int]): If an int, the bands from n = 0 to n = n_wannier are used to generate n_wannier functions. 
             If a tuple, the bands from n = n_wannier[0] to n_wannier[1] are used.
-            centers (list[list[float]]): The center of each WF, one [x, ...] per function, e.g. [[x0, y0], [x1, y1]].
+            centers (list[list[float]] | xr.DataArray): The center of each WF, one [x, ...] per function,
+            e.g. [[x0, y0], [x1, y1]]. Where the best centres differ across parameter space (the sites
+            of a lattice can move, or swap which is deeper), pass a DataArray with dims ("n", "coord")
+            plus any of the parameter dims; it is selected at each parameter point.
             parallel (bool, optional): Wheter to parallelize the whole function. Defaults to False.
             n_cores (int, optional): Numbers of cores to use in case of parallelization. Defaults to -1.
             blockwargs (dict, optional): Arguments to pass on to the Bloch-Schrödinger solver constructor function. Defaults to {}.
@@ -657,9 +675,22 @@ class Wannier:
         seeds = np.random.SeedSequence(seed).spawn(n_tot)
         rngs = [np.random.default_rng(s) for s in seeds] if seed is not None else [None] * n_tot
 
+        def centers_at(x):
+            """The centres at parameter point x, as a plain nested list."""
+            if not isinstance(centers, xr.DataArray):
+                return centers
+            if set(centers.dims) - {"n", "coord", *x}:
+                raise ValueError(
+                    f"centers has dims {centers.dims}; beyond 'n' and 'coord' it may only carry "
+                    f"parameter dims of the potential, which are {tuple(x)}"
+                )
+            at = centers.sel({d: v for d, v in x.items() if d in centers.dims})
+            return at.transpose("n", "coord").values.tolist()
+
         def f(x, rng):
             return self.compute_U_mnk(
-                x, centers, tol, max_iter=max_iter, method=method, rng=rng, return_info=True
+                x, centers_at(x), tol, max_iter=max_iter, method=method, rng=rng,
+                return_info=True,
             )
         
         args = list(zip(selections, rngs))
