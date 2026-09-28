@@ -17,6 +17,11 @@ def islinspace(arr: xr.DataArray) -> tuple[bool, float]:
         tuple[bool, float]: The first element is a boolean equal to True if it is regularily spaced. If True, then second element is the step size, otherwise it is 0.
     """
 
+    if np.size(arr) < 2:
+        # A single value is trivially regular; any positive step makes a valid (fixed) slider.
+        # Taking steps[0] of the empty difference array below used to raise an IndexError, so
+        # a scan with one I0 or one wavelength could not be plotted at all.
+        return True, 1.0
     step = 0
     islin = False
     steps = (arr.data - np.roll(arr.data, -1))[:-1]

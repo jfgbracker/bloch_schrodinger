@@ -271,3 +271,14 @@ def test_centers_with_an_unknown_dim_are_rejected():
     centers = xr.DataArray([[[0.0]]], dims=("theta", "n", "coord"))
     with pytest.raises(ValueError, match="parameter dims"):
         w.solve(n_wannier=1, centers=centers, blockwargs={"E_lim": 150}, verbose=False)
+
+
+def test_a_single_valued_parameter_still_gets_a_slider():
+    """Regression: islinspace indexed the first step of a length-1 axis and raised IndexError,
+    so any plot of a scan with one value along some axis (one intensity, say) failed."""
+    from bloch_schrodinger.utils import create_sliders_from_dims, islinspace
+
+    one = xr.DataArray([200.0], dims="I0", coords={"I0": [200.0]}).I0
+    assert islinspace(one) == (True, 1.0)
+    slider = create_sliders_from_dims({"I0": one})["I0"]
+    assert slider.min == slider.max == slider.value == 200.0
