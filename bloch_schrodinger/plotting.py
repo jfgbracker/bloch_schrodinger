@@ -1814,6 +1814,47 @@ def plot_isosurface(
     return fig
 
 
+def _minima_overlay(
+    fig: Figure,
+    ax: Axes,
+    potential: Potential,
+    cart_axes: list[int],
+    sliders: dict,
+    minima_kwargs: dict,
+    size: int,
+    mode: str,
+) -> Callable:
+    """Scatter the local minima of 'potential' on 'ax' and return the function that moves them with the
+    sliders. On a map they sit at their cartesian position, in the order of 'cart_axes'; on a line plot
+    (a single cart_axis, 1D potential) at their position and value, on the potential's curve.
+
+    Only the sliders of the potential's own parameter dims select it: the figure's other sliders (a band
+    index, a second field's parameters) do not concern its minima.
+    """
+    param_dims = [d for d in potential.V.dims if d not in [f"a{k + 1}" for k in range(potential.n_dims)]]
+    kwargs = dict(color="red", marker="o", s=30, zorder=5)
+    kwargs.update(minima_kwargs)
+
+    def offsets(slider_values: dict) -> np.ndarray:
+        sel = {d: slider_values[d] for d in param_dims if d in slider_values}
+        found = potential.find_minima(sel, size=size, mode=mode)
+        if len(cart_axes) == 1:
+            columns = [found[0], found[-2]]          # position, and the value of the potential there
+        else:
+            columns = [found[k] for k in cart_axes]
+        pts = np.column_stack([np.asarray(c.values, dtype=float).ravel() for c in columns])
+        return pts[~np.isnan(pts).any(axis=1)]       # NaN pads slices with fewer minima
+
+    initial = offsets({d: w.value for d, w in sliders.items()})
+    scatter = ax.scatter(initial[:, 0], initial[:, 1], **kwargs)
+
+    def update(**slider_values):
+        scatter.set_offsets(offsets(slider_values))
+        fig.canvas.draw_idle()
+
+    return update
+
+
 def plot_eigenvector(
     plots: list[list[xr.DataArray | NoneType]],
     potentials: list[list[Potential | NoneType]],
@@ -1823,6 +1864,10 @@ def plot_eigenvector(
     cart_axes: list[int] | list[list[list[int]]] = [0, 1],
     resolutions: list[list[int|tuple[int]|NoneType]] = None,
     cst_bds: bool = False,
+    show_minima: bool | list[list[bool]] = False,
+    minima_kwargs: dict = {},
+    minima_size: int = 3,
+    minima_mode: str = "wrap",
 ) -> tuple[Figure, list[Axes]]:
     """The main function to plot eigenvectors in a interactive manner.
 
@@ -1846,9 +1891,22 @@ def plot_eigenvector(
         as a rescaling solver's do. True holds the axes at the largest frame the run ever reaches, so that
         the cloud is seen to grow; False lets them follow the current frame, so the cloud keeps its apparent
         size and it is the axis labels that change. Defaults to False.
+        show_minima (bool | list[list[bool]], optional): Whether to mark the local minima of each subplot's
+        potential, found with 'Potential.find_minima' at the current position of the sliders. Either one value
+        for every subplot or a matrix with the same shape as 'plots'. On a map the minima are scattered on the
+        map; on a line plot, on the potential's curve. Only subplots that have a potential and show all of its
+        space are marked: a cut through a higher-dimensional landscape has no reason to contain its minima.
+        Defaults to False.
+        minima_kwargs (dict, optional): Keyword arguments for the scatter of the minima. Defaults to {}, which
+        draws red dots, as 'Potential.plot' does.
+        minima_size (int, optional): The neighbourhood, in pixels, used to detect a minimum; see
+        'Potential.find_minima'. Defaults to 3.
+        minima_mode (str, optional): Boundary handling for the detection: 'wrap' for a periodic potential,
+        'nearest' otherwise; see 'Potential.find_minima'. Defaults to 'wrap'.
 
     Raises:
-        ValueError: Raise errors if the shapes are not consistent, or if quivers are given for a subplot with a single cart_axis.
+        ValueError: Raise errors if the shapes are not consistent, if quivers are given for a subplot with a
+        single cart_axis, or if minima are asked for on a subplot that has no potential or shows only a cut of it.
     """
     n_rows = len(plots)
     n_cols = len(plots[0])
@@ -1872,6 +1930,11 @@ def plot_eigenvector(
 
     if quivers is None:
         quivers = [[None] * n_cols for u in range(n_rows)]
+
+    if isinstance(show_minima, bool):
+        show_minima = [[show_minima] * n_cols for _ in range(n_rows)]
+    elif len(show_minima) != n_rows or any(len(row) != n_cols for row in show_minima):
+        raise ValueError("show_minima, given as a matrix, must have the same shape as plots")
 
     funcs: list[Callable] = []
     sliders = {}
@@ -1933,6 +1996,16 @@ def plot_eigenvector(
                 raise ValueError(
                     f"quivers require 2 cart_axes; quiver plots have no 1D analog (cell [{i}][{j}])"
                 )
+            if show_minima[i][j]:
+                if poten is None:
+                    raise ValueError(
+                        f"show_minima needs a potential to find the minima of (cell [{i}][{j}])"
+                    )
+                if sorted(cart_axe) != list(range(poten.n_dims)):
+                    raise ValueError(
+                        f"show_minima needs the subplot to span the whole space, but cart_axes="
+                        f"{cart_axe} only shows a cut of a {poten.n_dims}D potential (cell [{i}][{j}])"
+                    )
 
             if len(cart_axe) == 1:
                 if plot is not None:
@@ -1963,6 +2036,11 @@ def plot_eigenvector(
                     ax_pot.tick_params(axis="y", colors="gray")
                     sliders.update(slids)
                     funcs += [up]
+                    if show_minima[i][j]:
+                        funcs += [_minima_overlay(
+                            fig, ax_pot, poten, cart_axe, sliders, minima_kwargs, minima_size,
+                            minima_mode,
+                        )]
             else:
                 if plot is not None:
                     slids, up, ax = create_map(
@@ -1976,6 +2054,11 @@ def plot_eigenvector(
                     )
                     sliders.update(slids)
                     funcs += [up]
+                    if show_minima[i][j]:
+                        funcs += [_minima_overlay(
+                            fig, ax, poten, cart_axe, sliders, minima_kwargs, minima_size,
+                            minima_mode,
+                        )]
                 if quiv is not None:
                     slids, up, ax = create_quiver(
                         fig, ax, cart_axe, quiv[0], quiv[1], template[2]

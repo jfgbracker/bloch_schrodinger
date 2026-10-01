@@ -995,11 +995,25 @@ class Potential:
                 line = np.asarray(Vslice.coords[d].values, dtype=float)
                 step = line[1] - line[0] if len(line) > 1 else 0.0
                 lattice_min.append(line[0] + centers[:, i] * step)
-            # Cartesian coordinate i = sum over lattice coords weighted by unit vector components
-            cart_min = [
-                sum(self.a[j, i] * lattice_min[j] for j in range(self.n_dims))
-                for i in range(self.n_dims)
-            ]
+            # The cartesian coordinates are read off the potential's own x, y, z, which are linear in
+            # the grid indices too. Going through the unit vectors instead (sum_j a[j] * lattice_j)
+            # is only right when the lattice coordinates are in units of those vectors, which a
+            # tiled potential's are not: Potential.tile scales the unit vectors by the number of
+            # cells but leaves V's a1, a2 in the original cell's units, so every minimum came out
+            # that many times too far from the origin.
+            first = (0,) * self.n_dims
+            cart_min = []
+            for c in cart:
+                grid = np.asarray(
+                    Vslice.coords[c].broadcast_like(Vslice).transpose(*spatial).values,
+                    dtype=float,
+                )
+                pos = np.full(len(centers), grid[first])
+                for j in range(self.n_dims):
+                    if grid.shape[j] > 1:
+                        nxt = tuple(1 if k == j else 0 for k in range(self.n_dims))
+                        pos = pos + centers[:, j] * (grid[nxt] - grid[first])
+                cart_min.append(pos)
             # All the pixels of a group hold the same value, so any of them gives it
             v_min = data[tuple(members.T)]
 

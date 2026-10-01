@@ -32,6 +32,7 @@ eigva, eigve = FDSolver(pot, 1 / 2).solve(5)   # eigva: (band, omega), eigve: (b
 | Cut through the potential | `pot.plot(cart_axes=[0])` or `bp.plot_eigenvector([[pot.V]], [[None]], cart_axes=[0])` |
 | Eigenvalues vs. a parameter | `bp.plot_cuts(eigva, "omega")` |
 | Eigenvector maps | `bp.plot_eigenvector([[abs(eigve)**2]], [[pot]], [["amplitude"]])` |
+| ... with the potential's minima marked | add `show_minima=True` (or a matrix like `plots`, per subplot) |
 | Cuts through eigenvectors | `bp.plot_eigenvector([[eigve.real]], [[pot]], cart_axes=[0])` |
 | Eigenvalues and eigenvectors side by side | `bp.dashboard(eigva, "omega", [[abs(eigve)**2]], pot, "amplitude")` |
 | Mode profiles at their energies, over a potential cut | `bp.energy_levels(eigva, eigve, pot)` |

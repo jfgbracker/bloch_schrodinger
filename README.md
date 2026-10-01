@@ -28,8 +28,8 @@ carrying these things that are not (yet) upstream:
 
 1. **`bloch_schrodinger.hubbard`** — the exact Hubbard `U`, described above.
 2. **`Potential.find_minima()`, `Potential.smooth()`, `Potential.plot_3d()`**, and
-   `Potential.plot(show_minima=…)` — helpers for locating and displaying the sites of a
-   lattice. `find_minima()` returns one array per cartesian coordinate, then the potential
+   `Potential.plot(show_minima=…)` and `plot_eigenvector(..., show_minima=…)` — helpers for
+   locating and displaying the sites of a lattice. `find_minima()` returns one array per cartesian coordinate, then the potential
    value, then a `Dataset` of lattice coordinates, so the 2D call reads
    `x, y, v, coords = pot.find_minima()`.
 3. **A Python 3.11 floor** instead of 3.12+ — see below.
