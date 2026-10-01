@@ -103,15 +103,23 @@ def test_line_plot_marks_the_minima_on_the_potential_curve():
     assert same_points(pts, np.column_stack([np.asarray(x), np.asarray(v)]))
 
 
-def test_minima_need_a_potential_and_the_whole_space():
+def test_subplots_that_cannot_show_minima_are_skipped():
+    """A cut through the 2D potential, and a subplot without a potential, in the same grid as a
+    full map: show_minima=True marks the map and leaves the other two alone."""
     pot = wells_2d()
-    with pytest.raises(ValueError, match="needs a potential"):
-        plot_eigenvector([[field_on(pot)]], [[None]], show_minima=True)
-    with pytest.raises(ValueError, match="span the whole space"):
-        plot_eigenvector([[field_on(pot)]], [[pot]], cart_axes=[0], show_minima=True)
+    _, axes = plot_eigenvector(
+        [[field_on(pot), field_on(pot), field_on(pot)]], [[pot, pot, None]],
+        cart_axes=[[[0, 1], [0], [0, 1]]], show_minima=True, minima_kwargs={"label": "minima"},
+    )
+    fig = axes[0][0].figure
+    marked = [a for a in fig.axes if any(c.get_label() == "minima" for c in a.collections)]
+    assert marked == [axes[0][0]]
+
+
+def test_show_minima_matrix_must_match_plots():
+    pot = wells_2d()
     with pytest.raises(ValueError, match="same shape"):
         plot_eigenvector([[field_on(pot)]], [[pot]], show_minima=[[True, True]])
-
 
 def test_minima_of_a_tiled_potential_are_where_its_wells_are():
     """Regression: find_minima mapped lattice coordinates through the unit vectors, which

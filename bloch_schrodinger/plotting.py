@@ -1895,8 +1895,9 @@ def plot_eigenvector(
         potential, found with 'Potential.find_minima' at the current position of the sliders. Either one value
         for every subplot or a matrix with the same shape as 'plots'. On a map the minima are scattered on the
         map; on a line plot, on the potential's curve. Only subplots that have a potential and show all of its
-        space are marked: a cut through a higher-dimensional landscape has no reason to contain its minima.
-        Defaults to False.
+        space are marked; the others -- a cut through a higher-dimensional landscape, which has no reason to
+        contain its minima, or a subplot without a potential -- are skipped, so one True serves a grid that
+        mixes maps and cuts. Defaults to False.
         minima_kwargs (dict, optional): Keyword arguments for the scatter of the minima. Defaults to {}, which
         draws red dots, as 'Potential.plot' does.
         minima_size (int, optional): The neighbourhood, in pixels, used to detect a minimum; see
@@ -1905,8 +1906,8 @@ def plot_eigenvector(
         'nearest' otherwise; see 'Potential.find_minima'. Defaults to 'wrap'.
 
     Raises:
-        ValueError: Raise errors if the shapes are not consistent, if quivers are given for a subplot with a
-        single cart_axis, or if minima are asked for on a subplot that has no potential or shows only a cut of it.
+        ValueError: Raise errors if the shapes are not consistent, or if quivers are given for a subplot with a
+        single cart_axis.
     """
     n_rows = len(plots)
     n_cols = len(plots[0])
@@ -1996,16 +1997,15 @@ def plot_eigenvector(
                 raise ValueError(
                     f"quivers require 2 cart_axes; quiver plots have no 1D analog (cell [{i}][{j}])"
                 )
-            if show_minima[i][j]:
-                if poten is None:
-                    raise ValueError(
-                        f"show_minima needs a potential to find the minima of (cell [{i}][{j}])"
-                    )
-                if sorted(cart_axe) != list(range(poten.n_dims)):
-                    raise ValueError(
-                        f"show_minima needs the subplot to span the whole space, but cart_axes="
-                        f"{cart_axe} only shows a cut of a {poten.n_dims}D potential (cell [{i}][{j}])"
-                    )
+            # Minima are only marked where they can be: a subplot with a potential that shows all
+            # of its space. A cut through a higher-dimensional landscape has no reason to contain
+            # its minima, so such subplots (and ones without a potential) are skipped, not refused:
+            # one show_minima=True can then serve a grid that mixes maps and cuts.
+            mark_minima = (
+                show_minima[i][j]
+                and poten is not None
+                and sorted(cart_axe) == list(range(poten.n_dims))
+            )
 
             if len(cart_axe) == 1:
                 if plot is not None:
@@ -2036,7 +2036,7 @@ def plot_eigenvector(
                     ax_pot.tick_params(axis="y", colors="gray")
                     sliders.update(slids)
                     funcs += [up]
-                    if show_minima[i][j]:
+                    if mark_minima:
                         funcs += [_minima_overlay(
                             fig, ax_pot, poten, cart_axe, sliders, minima_kwargs, minima_size,
                             minima_mode,
@@ -2054,7 +2054,7 @@ def plot_eigenvector(
                     )
                     sliders.update(slids)
                     funcs += [up]
-                    if show_minima[i][j]:
+                    if mark_minima:
                         funcs += [_minima_overlay(
                             fig, ax, poten, cart_axe, sliders, minima_kwargs, minima_size,
                             minima_mode,
