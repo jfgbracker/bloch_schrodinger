@@ -17,6 +17,7 @@ from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
+from bloch_schrodinger.lattice import LatticeGeometry, attach_lattice, resolve_geometry
 from bloch_schrodinger.potential import Potential
 from bloch_schrodinger.utils import (
     create_cart_grid,
@@ -735,6 +736,8 @@ def dashboard(
     linekws: list[dict] | dict = {"color": "blue"},
     autoscale: bool = True,
     cart_axes: list[int] = [0, 1],
+    lattice: bool | LatticeGeometry = False,
+    lattice_kwargs: dict = {},
 ) -> tuple[Figure, Axes]:
     """A high-level function to plot the eigenvalues and the eigenvectors at the same time. see docs\\AtomicToMolecular.ipynb for an example.
 
@@ -758,6 +761,12 @@ def dashboard(
         autoscale (bool, optional): Set to False to stop the rescaling of the yaxis of the band plot. Defaults to True.
         cart_axes (list[int], optional): The two cartesian axes to plot against, with 0 = "x", 1 = "y" and 2 = "z".
         See create_map for how axes not matching the data's own native a1,a2 are handled. Defaults to [0, 1].
+        lattice (bool | LatticeGeometry, optional): Draw the lattice schematically on every map, as in
+        'plot_eigenvector': the sites the potential's minima snap to, following the sliders. True uses
+        the potential's own 'geometry'. Defaults to False.
+        lattice_kwargs (dict, optional): Options of the drawing, see 'plot_eigenvector'. Defaults to {}.
+
+    A contour template of None, as in template=('amplitude', None), leaves out the contours.
     """
     n_rows = len(eigveplots)
     n_cols = len(eigveplots[0])
@@ -802,6 +811,10 @@ def dashboard(
         return template
 
     template = format_template(template)
+    geometry = resolve_geometry(lattice, potential)
+    if geometry is not None and sorted(cart_axes) != [0, 1]:
+        raise ValueError("the lattice overlay needs x, y maps (cart_axes [0, 1] or [1, 0])")
+    overlay_axes = []
     # 2D maps plot
     for i in range(n_rows):
         for j in range(n_cols):
@@ -819,21 +832,32 @@ def dashboard(
                 sliders.update(slider_ax)
                 funcs += [up]
 
-                slider_ax, up, ax = create_map(
-                    fig, ax, cart_axes, potential.V, "contour", template=template[1]
-                )
-                sliders.update(slider_ax)
-                funcs += [up]
+                if template[1] is not None:
+                    slider_ax, up, ax = create_map(
+                        fig, ax, cart_axes, potential.V, "contour", template=template[1]
+                    )
+                    sliders.update(slider_ax)
+                    funcs += [up]
 
                 co1, co2 = coord_names[cart_axes[0]], coord_names[cart_axes[1]]
                 ax.set_xlim(np.min(plot.coords[co1]), np.max(plot.coords[co1]))
                 ax.set_ylim(np.min(plot.coords[co2]), np.max(plot.coords[co2]))
+                if geometry is not None:
+                    overlay_axes.append(ax)
                 ax.set_aspect("equal")
                 ax.xaxis.set_visible(False)
                 ax.yaxis.set_visible(False)
                 for sp in ["bottom", "top", "left", "right"]:
                     ax.spines[sp].set_visible(spines)
                 ax.set_title(titles[i][j])
+
+    if overlay_axes:
+        start = {d: w.value for d, w in sliders.items()}
+        whole = potential if potential is not None and potential.n_dims == 2 else None
+        lkw = {**lattice_kwargs}
+        for oax in overlay_axes:
+            funcs += [attach_lattice(oax, geometry, whole, start, swap_xy=list(cart_axes) == [1, 0],
+                                     **lkw).update]
 
     # band plot
     ax = fig.add_subplot(gs_bands[0, 0])
@@ -1868,6 +1892,8 @@ def plot_eigenvector(
     minima_kwargs: dict = {},
     minima_size: int = 3,
     minima_mode: str = "wrap",
+    lattice: bool | LatticeGeometry | list[list[bool | LatticeGeometry | NoneType]] = False,
+    lattice_kwargs: dict = {},
 ) -> tuple[Figure, list[Axes]]:
     """The main function to plot eigenvectors in a interactive manner.
 
@@ -1904,6 +1930,20 @@ def plot_eigenvector(
         'Potential.find_minima'. Defaults to 3.
         minima_mode (str, optional): Boundary handling for the detection: 'wrap' for a periodic potential,
         'nearest' otherwise; see 'Potential.find_minima'. Defaults to 'wrap'.
+        lattice (bool | LatticeGeometry | list[list], optional): Draw the lattice schematically on the
+        maps, as labelled circles at its sites (see 'bloch_schrodinger.lattice'). True uses each
+        subplot's potential's own 'geometry'; a LatticeGeometry uses that one. With a potential that the
+        map shows whole, the circles are the sites its minima snap to at the current sliders (see
+        'Potential.find_sites'), so they follow the sliders; without one, every site of the geometry is
+        drawn. Either one value for every subplot or a matrix with the shape of 'plots'; cuts are
+        skipped. Defaults to False.
+        lattice_kwargs (dict, optional): Options of the drawing, shared by the subplots: occupied
+        ('minima', 'all' or a list of labels), tol (the snapping tolerance, a fraction of the
+        nearest-neighbour distance), and the styles of 'LatticeOverlay' -- bonds, empty_sites,
+        unit_cell, labels, colors, size, site_kwargs, ... . Defaults to {}.
+
+    A contour template of None (the second entry of a template tuple) leaves out the contours of the
+    potential, which is still used for the minima and the lattice: e.g. ('real', None).
 
     Raises:
         ValueError: Raise errors if the shapes are not consistent, or if quivers are given for a subplot with a
@@ -1936,6 +1976,12 @@ def plot_eigenvector(
         show_minima = [[show_minima] * n_cols for _ in range(n_rows)]
     elif len(show_minima) != n_rows or any(len(row) != n_cols for row in show_minima):
         raise ValueError("show_minima, given as a matrix, must have the same shape as plots")
+
+    if not isinstance(lattice, list):
+        lattice = [[lattice] * n_cols for _ in range(n_rows)]
+    elif len(lattice) != n_rows or any(len(row) != n_cols for row in lattice):
+        raise ValueError("lattice, given as a matrix, must have the same shape as plots")
+    overlays = []
 
     funcs: list[Callable] = []
     sliders = {}
@@ -2048,12 +2094,13 @@ def plot_eigenvector(
                     )
                     sliders.update(slids)
                     funcs += [up]
-                if poten is not None:
+                if poten is not None and template[1] is not None:
                     slids, up, ax = create_map(
                         fig, ax, cart_axe, poten.V, "contour", resolution, template[1], cst_bds
                     )
                     sliders.update(slids)
                     funcs += [up]
+                if poten is not None:
                     if mark_minima:
                         funcs += [_minima_overlay(
                             fig, ax, poten, cart_axe, sliders, minima_kwargs, minima_size,
@@ -2085,7 +2132,18 @@ def plot_eigenvector(
                     ax.set_ylim(np.min(bounds.coords[co2]), np.max(bounds.coords[co2]))
             if len(cart_axe) == 2:
                 ax.set_aspect("equal")
+            geometry = resolve_geometry(lattice[i][j], poten)
+            if geometry is not None and sorted(cart_axe) == [0, 1]:
+                # drawn last, over the field and inside the final limits; with a potential that the
+                # map shows whole, the occupied sites are those its minima snap to
+                whole = poten is not None and poten.n_dims == 2
+                overlays.append((ax, geometry, poten if whole else None, list(cart_axe) == [1, 0]))
             axes[i][j] = ax
+
+    start = {d: w.value for d, w in sliders.items()}
+    for ax, geometry, poten, swap in overlays:
+        lkw = {"minima_size": minima_size, "minima_mode": minima_mode, **lattice_kwargs}
+        funcs += [attach_lattice(ax, geometry, poten, start, swap_xy=swap, **lkw).update]
 
     def update(**kwargs):
         for f in funcs:

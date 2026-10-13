@@ -1,4 +1,5 @@
 import itertools
+import warnings
 from copy import deepcopy
 
 import matplotlib.pyplot as plt
@@ -14,6 +15,7 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 
+from bloch_schrodinger.lattice import LatticeGeometry, attach_lattice, resolve_geometry
 from bloch_schrodinger.utils import create_cart_grid, create_sliders
 
 
@@ -208,6 +210,9 @@ class Potential:
             {self.coord_names[i]: self.coords[i] for i in range(self.n_dims)}
         )
         self._add_aliases()
+        # The known geometry of the lattice, if any (a LatticeGeometry): its named sites are where
+        # 'find_sites' snaps the minima to, and what the 'lattice' option of the plots draws
+        self.geometry: LatticeGeometry | None = None
         # Definitions for retrocompatibility
         if self.n_dims == 2:
             self.da1 = self.da[0]
@@ -552,6 +557,8 @@ class Potential:
         minima_kwargs: dict = {},
         minima_size: int = 3,
         minima_mode: str = "wrap",
+        lattice: "bool | LatticeGeometry" = False,
+        lattice_kwargs: dict = {},
         **kwargs,
     ) -> tuple[Figure, Axes] | tuple[Figure, Axes, Axes]:
         """Creates an interactive plot of the potential, with all the parameters as sliders.
@@ -571,6 +578,12 @@ class Potential:
             see 'find_minima'. Defaults to 3.
             minima_mode (str, optional): boundary handling mode used to detect local minima, see 'find_minima'.
             Defaults to 'wrap'.
+            lattice (bool | LatticeGeometry, optional): Draw the lattice schematically on a 2D map: the
+            sites the minima snap to (see 'find_sites') as labelled circles, following the sliders.
+            True uses the potential's own 'geometry'; a LatticeGeometry uses that one. Defaults to False.
+            lattice_kwargs (dict, optional): Options of the drawing: occupied ('minima', 'all' or a
+            list of labels), tol (the snapping tolerance), and the styles of 'LatticeOverlay' --
+            bonds, empty_sites, unit_cell, labels, colors, size, ... . Defaults to {}.
 
         Raises:
             ValueError: If the number of cartesian axes to plot against is not 1 or 2, or if 'show_minima' is
@@ -681,10 +694,21 @@ class Potential:
             offsets = minima_offsets(initial_sel)
             scatter = ax.scatter(offsets[:, 0], offsets[:, 1], **default_minima_kwargs)
 
+        geometry = resolve_geometry(lattice, self)
+        overlay = None
+        if geometry is not None:
+            if plot_dim != 2 or sorted(cart_axes) != [0, 1] or self.n_dims != 2:
+                raise ValueError("the lattice overlay needs a 2D potential drawn as an x, y map")
+            lkw = {"minima_size": minima_size, "minima_mode": minima_mode, **lattice_kwargs}
+            overlay = attach_lattice(ax, geometry, self, initial_sel, swap_xy=list(cart_axes) == [1, 0],
+                                     **lkw)
+
         def update(**slkwargs):
             sel = {dim: slkwargs[dim] for dim in slider_dims}
 
             new_potential = Vtmp.sel(sel, method="nearest")
+            if overlay is not None:
+                overlay.update(**sel)
 
             if plot_dim == 1:
                 pad = max(0.001, (new_potential.max() - new_potential.min()) * 0.05)
@@ -726,6 +750,8 @@ class Potential:
         minima_kwargs: dict = {},
         minima_size: int = 3,
         minima_mode: str = "wrap",
+        lattice: "bool | LatticeGeometry" = False,
+        lattice_kwargs: dict = {},
         **kwargs,
     ) -> tuple[Figure, Axes] | tuple[Figure, Axes, Axes]:
         """Creates an interactive 3D surface ('egg carton') plot of a 2D potential, with all the parameters
@@ -1047,6 +1073,76 @@ class Potential:
 
         return (*cart_das, v_da, minima_coords)
 
+    def find_sites(
+        self,
+        geometry: LatticeGeometry | None = None,
+        selection: dict = {},
+        tol: float = 0.1,
+        size: int = 3,
+        mode: str = "wrap",
+        warn: bool = True,
+    ) -> xr.Dataset:
+        """The local minima (see 'find_minima'), snapped onto the sites of a known lattice geometry
+        and labelled with their names. Only for 2D potentials.
+
+        A minimum found on the grid is only as precise as the grid spacing. When it is within 'tol'
+        times the nearest-neighbour distance of a site of the geometry, it is moved exactly onto
+        that site and gets its label ("A", "B", ...); otherwise it is kept where it was found, with
+        the label "" and on_site False, and a warning lists it.
+
+        Args:
+            geometry (LatticeGeometry, optional): The geometry; defaults to the potential's own
+            'geometry' attribute (set by the lattice constructors, or by hand).
+            selection (dict, optional): As in 'find_minima'. Defaults to {}.
+            tol (float, optional): The snapping tolerance, a fraction of the nearest-neighbour
+            distance of the geometry. Defaults to 0.1.
+            size (int, optional): As in 'find_minima'. Defaults to 3.
+            mode (str, optional): As in 'find_minima'. Defaults to 'wrap'.
+            warn (bool, optional): Warn about minima that match no site. Defaults to True.
+
+        Returns:
+            xr.Dataset: Along "minima" (plus the remaining parameter dimensions, padded with NaN
+            where a slice has fewer minima): 'x', 'y' the snapped positions, 'x_found', 'y_found'
+            the positions found on the grid, 'v' the potential at the minimum, 'label' (str),
+            'on_site' (bool) and 'distance' (from the found position to the nearest site).
+        """
+        geometry = geometry if geometry is not None else getattr(self, "geometry", None)
+        if geometry is None:
+            raise ValueError("no geometry: pass one, or set the potential's 'geometry' attribute")
+        if self.n_dims != 2:
+            raise ValueError("find_sites works on 2D potentials")
+        x, y, v, _ = self.find_minima(selection, size=size, mode=mode)
+        dims = list(x.dims)
+        pts = np.stack([np.asarray(x.values, float), np.asarray(y.values, float)], axis=-1)
+        flat = pts.reshape(-1, 2)
+        snapped = geometry.snap(flat, tol=tol, warn=False)
+        valid = ~np.isnan(flat).any(axis=1)
+        off = valid & ~snapped.on_site
+        if warn and off.any():
+            warnings.warn(
+                f"{int(off.sum())} minimum/minima not within {tol:g} x the nearest-neighbour "
+                f"distance of a site of the {geometry.name} geometry, kept where found: "
+                + ", ".join(f"({p[0]:.4g}, {p[1]:.4g})" for p in flat[off][:5])
+                + (" ..." if off.sum() > 5 else ""),
+                stacklevel=2,
+            )
+        shape = x.shape
+        pos = snapped.positions.reshape(shape + (2,))
+        labels = np.array(snapped.labels, dtype=object).reshape(shape)
+        return xr.Dataset(
+            {
+                "x": (dims, pos[..., 0]),
+                "y": (dims, pos[..., 1]),
+                "x_found": (dims, pts[..., 0]),
+                "y_found": (dims, pts[..., 1]),
+                "v": (dims, np.asarray(v.values)),
+                "label": (dims, labels),
+                "on_site": (dims, snapped.on_site.reshape(shape)),
+                "distance": (dims, snapped.distances.reshape(shape)),
+            },
+            coords=x.coords,
+        )
+
     def coarsen(self, factor: tuple[int]) -> "Potential":
         """Return a coarsened copy of the Potential, with reduced resolution along all axes.
 
@@ -1180,11 +1276,22 @@ class Potential:
             tiled.da2 = ls[1] / n_tots[1]
             tiled.a1 = tiled.a[0]
             tiled.a2 = tiled.a[1]
+        # The geometry is that of the primitive lattice, which tiling does not change
+        tiled.geometry = getattr(self, "geometry", None)
 
         return tiled
 
 
 paramType = int | float | xr.DataArray
+
+
+def _optical_honeycomb_geometry(a1, a2, a, M, theta) -> LatticeGeometry | None:
+    """The geometry of the three-beam honeycomb: A at M (-a/2, 0), the s2 sublattice, B at
+    M (a/2, 0), the s1 one, C at the hexagon centre. None when theta is a parameter, since the
+    sites then move with it."""
+    if isinstance(theta, xr.DataArray) and theta.size > 1:
+        return None
+    return LatticeGeometry.hexagonal(a1, a2, origin=M @ np.array([-a / 2, 0.0]))
 
 
 def optical_honeycomb(
@@ -1203,7 +1310,9 @@ def optical_honeycomb(
         theta (paramType, optional): Rotates the whole lattice by an angle theta. Defaults to 0.
 
     Returns:
-        tuple[dict, Potential]: A dictionary containing most geometrical quantities relative to the lattice, and the constructed potential object
+        tuple[dict, Potential]: A dictionary containing most geometrical quantities relative to the lattice, and the constructed potential object.
+        Its 'geometry' (also set as the potential's 'geometry' attribute) names the sites: A at (-a/2, 0), the s2 sublattice,
+        B at (a/2, 0), the s1 one, and C, the hexagon centre (all rotated by theta; None if theta is a parameter).
     """
 
     kl = 2 * np.pi / wavelength
@@ -1251,9 +1360,11 @@ def optical_honeycomb(
         tri_2 += 2 * np.cos((dirs[i - 1] - dirs[i]) + 2 * np.pi / 3) / 2
 
     honeycomb.set(tri_1 * V1 + tri_2 * V2)
+    honeycomb.geometry = _optical_honeycomb_geometry(a1, a2, a, M, theta)
 
     constants = dict(
-        a=a, E_r=E_r, a1=a1, a2=a2, a1s=a1s, a2s=a2s, K=K, k1=k1, k2=k2, k3=k3
+        a=a, E_r=E_r, a1=a1, a2=a2, a1s=a1s, a2s=a2s, K=K, k1=k1, k2=k2, k3=k3,
+        geometry=honeycomb.geometry,
     )
 
     return constants, honeycomb
@@ -1276,7 +1387,8 @@ def make_optical_honeycomb(
         theta (paramType, optional): Rotates the whole lattice by an angle theta. Defaults to 0.
 
     Returns:
-        tuple[dict, Potential]: A dictionary containing most geometrical quantities relative to the lattice, and the constructed potential object
+        tuple[dict, Potential]: A dictionary containing most geometrical quantities relative to the lattice, and the constructed potential object.
+        Its 'geometry' (also set as the potential's 'geometry' attribute) names the sites, as in 'optical_honeycomb'.
     """
 
     kl = 2 * np.pi / wavelength
@@ -1317,9 +1429,11 @@ def make_optical_honeycomb(
         tri_2 += 2 * np.cos((dirs[i - 1] - dirs[i]) + 2 * np.pi / 3) / 2
 
     potential.set(tri_1 * V1 + tri_2 * V2)
+    potential.geometry = _optical_honeycomb_geometry(a1, a2, a, M, theta)
 
     constants = dict(
-        a=a, E_r=E_r, a1=a1, a2=a2, a1s=a1s, a2s=a2s, K=K, k1=k1, k2=k2, k3=k3
+        a=a, E_r=E_r, a1=a1, a2=a2, a1s=a1s, a2s=a2s, K=K, k1=k1, k2=k2, k3=k3,
+        geometry=potential.geometry,
     )
 
     return constants, potential
@@ -1342,7 +1456,8 @@ def honeycomb(
         **kwargs: Additional arguments passed to the Potential constructor.
 
     Returns:
-        Potential: The constructed honeycomb potential.
+        Potential: The constructed honeycomb potential. Its 'geometry' names the pillars A (radius rA, at (0, a/2)) and
+        B (radius rB, at (0, -a/2)), and the hexagon centre C.
     """
 
     a1 = np.array([-(3**0.5) / 2 * a, 3 / 2 * a])  # 1st lattice vector
@@ -1359,6 +1474,8 @@ def honeycomb(
         centerB = posB + a1 * uc[0] + a2 * uc[1]
         Honey.circle(centerA, rA, value=0)
         Honey.circle(centerB, rB, value=0)
+    # A and B as named here, C the hexagon centre
+    Honey.geometry = LatticeGeometry.hexagonal(a1, a2, origin=posA, ab=posB - posA)
 
     return Honey
 

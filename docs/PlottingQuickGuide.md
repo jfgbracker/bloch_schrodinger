@@ -33,6 +33,7 @@ eigva, eigve = FDSolver(pot, 1 / 2).solve(5)   # eigva: (band, omega), eigve: (b
 | Eigenvalues vs. a parameter | `bp.plot_cuts(eigva, "omega")` |
 | Eigenvector maps | `bp.plot_eigenvector([[abs(eigve)**2]], [[pot]], [["amplitude"]])` |
 | ... with the potential's minima marked | add `show_minima=True` (or a matrix like `plots`, per subplot) |
+| ... with the lattice drawn schematically (labelled sites, bonds) | add `lattice=True` (needs `pot.geometry`, see below) |
 | Cuts through eigenvectors | `bp.plot_eigenvector([[eigve.real]], [[pot]], cart_axes=[0])` |
 | Eigenvalues and eigenvectors side by side | `bp.dashboard(eigva, "omega", [[abs(eigve)**2]], pot, "amplitude")` |
 | Mode profiles at their energies, over a potential cut | `bp.energy_levels(eigva, eigve, pot)` |
@@ -91,6 +92,26 @@ bp.plot_eigenvector(
 - **3D data**: `cart_axes=[0, 2]` shows the x–z plane, and y becomes a slider. `resolutions` sets the grid resolution used when a skewed lattice has to be interpolated.
 - **Quivers**: `quivers=[[(U, V)]]` overlays arrows, e.g. a current or a spin texture. This only works on 2D maps.
 - **Coupled equations**: eigenvectors have a `field` dimension. Select a field before plotting, e.g. `eigve.sel(field=0)`. If you don't, `field` becomes a slider.
+
+## Lattice geometry: exact sites and a schematic overlay
+
+```python
+from bloch_schrodinger.lattice import LatticeGeometry, draw_lattice
+
+geom = LatticeGeometry.hexagonal(pot.a[0], pot.a[1], origin=(-a / 2, 0))  # A here, B and C from it
+pot.geometry = geom              # optical_honeycomb() and honeycomb() set it themselves
+pot.find_sites()                 # minima snapped onto the sites, labelled "A", "B", ...
+pot.plot(lattice=True)
+bp.plot_eigenvector([[abs(wannier)**2]], [[wpot]], [[("amplitude", None)]],   # None: no contours
+                    lattice=True, lattice_kwargs={"bonds": True, "empty_sites": True})
+draw_lattice(ax, geom, occupied=["A", "B"], bonds=True)                # on any Axes
+```
+
+- **Presets:** `hexagonal` (the C3 points A, B, C), `square`, `checkerboard`, `kagome` and `lieb`, built from the lattice vectors you give. A custom geometry is `LatticeGeometry(a1, a2, sites={"A": (0, 0), "B": (0.3, 0.5)})`, with the sites in fractional coordinates.
+- **Labels go by position.** A minimum on the C point is labelled C. Which points are wells is the physics.
+- **Snapping.** A minimum within `tol` (10 % of the nearest-neighbour distance) of a site moves onto it. Any other minimum is kept where it was found, marked with a grey ×, and listed in a warning.
+- **The occupied sites follow the sliders.** The overlay fills whatever the axes show, and is redrawn when you zoom.
+- **Styles** go in `lattice_kwargs`: `bonds`, `empty_sites`, `unit_cell`, `labels`, `colors={"A": "#c2185b"}`, `size`, `occupied="all"` or a list of labels, and `*_kwargs` passed on to matplotlib.
 
 ## Combined views
 
