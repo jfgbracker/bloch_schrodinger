@@ -509,9 +509,12 @@ def plot_cuts(
     list_linekw = linekws if isinstance(linekws, list) else [linekws]
 
     if len(groupby) > 0:
-        eigva_stack = eigva.stack(stacked=groupby).squeeze()
+        eigva_stack = eigva.stack(stacked=groupby)
     else:
-        eigva_stack = eigva.squeeze()
+        eigva_stack = eigva
+    # drop length-1 dims, but never the line axis or the groups: one group is still one line
+    eigva_stack = eigva_stack.squeeze([d for d in eigva_stack.dims
+                                       if eigva_stack.sizes[d] == 1 and d not in (dim, "stacked")])
 
     slider_dims = [d for d in eigva_stack.dims if d not in [dim, "stacked"]]
     sliders = create_sliders(eigva_stack, slider_dims)

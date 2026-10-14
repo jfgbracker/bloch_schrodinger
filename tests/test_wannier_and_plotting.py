@@ -282,3 +282,20 @@ def test_a_single_valued_parameter_still_gets_a_slider():
     assert islinspace(one) == (True, 1.0)
     slider = create_sliders_from_dims({"I0": one})["I0"]
     assert slider.min == slider.max == slider.value == 200.0
+
+
+@pytest.mark.parametrize("n_groups", [1, 3])
+def test_plot_cuts_draws_one_line_per_group_even_for_a_single_group(n_groups):
+    """A group-by dim of length 1 (a scan at one wavelength) is still one line, not squeezed away;
+    other length-1 dims are dropped and the remaining ones get sliders."""
+    import matplotlib.pyplot as plt
+    from bloch_schrodinger.plotting import plot_cuts
+
+    da = xr.DataArray(np.random.default_rng(0).normal(size=(n_groups, 5, 1, 2)),
+                      dims=("lambda_nm", "B_shift", "I0", "theta"),
+                      coords={"lambda_nm": np.arange(n_groups) + 1000.0, "B_shift": np.arange(5.0),
+                              "I0": [100.0], "theta": [0.0, 0.1]}, name="a_s")
+    fig, ax = plot_cuts(da, dim="B_shift", groupby=["lambda_nm"])
+    assert len(ax.lines) == n_groups
+    np.testing.assert_allclose(ax.lines[0].get_ydata(), da.isel(lambda_nm=0, I0=0, theta=0))
+    plt.close(fig)
