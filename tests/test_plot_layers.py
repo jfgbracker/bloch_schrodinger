@@ -9,14 +9,13 @@ exist so that a refactor cannot quietly change them: a bug that moves is as much
 a feature that breaks, because the notebooks that work around it stop working.
 """
 
-import json
-
 import matplotlib.pyplot as plt
 import numpy as np
 import pytest
 import xarray as xr
 
 import bloch_schrodinger.plotting as plotting
+from bloch_schrodinger.frames import lattice_dims
 from bloch_schrodinger.plotting import (
     cmesh_tmpl,
     contour_tmpl,
@@ -32,8 +31,6 @@ from bloch_schrodinger.potential import Potential, create_parameter
 # Deliberately not square: a square grid lets a transposition through unnoticed, and a
 # transposition is exactly what broke 'create_quiver'.
 NA1, NA2 = 12, 14
-
-FACTORS = {"x": ("rho_x", "lambda_x"), "y": ("rho_y", "lambda_y")}
 
 
 # --- fixtures ---------------------------------------------------------------------------------
@@ -73,41 +70,6 @@ def param2d():
     omega = create_parameter("omega", np.linspace(1, 2, 3))
     pot.set((pot.x**2 + 2 * pot.y**2) * omega)
     return pot
-
-
-@pytest.fixture
-def factored():
-    """A moving grid stored as an invariant lattice times a per-frame scale.
-
-    Built exactly as a run saved with 'store_frame=False' is: the cartesian coordinates are
-    dropped and the recipe for rebuilding them is left in an attribute instead, because
-    materialising them would cost one full-size array per axis per frame.
-    """
-    pot = Potential(unitvecs=[[8, 0], [0, 10]], resolution=(NA1, NA2), v0=0)
-    rho_x, rho_y = xr.broadcast(pot.x, pot.y)
-    tv = np.linspace(0, 1, 4)
-    t = xr.DataArray(tv, dims="t", coords={"t": tv})
-    lam = 1 + 0.7 * t
-    field = (np.exp(-(rho_x**2 + rho_y**2) / 4) * (1 + 0 * t)).transpose("t", "a1", "a2")
-    out = field.rename("f").drop_vars(["x", "y"]).assign_coords(
-        rho_x=rho_x.drop_vars(["x", "y"], errors="ignore"),
-        rho_y=rho_y.drop_vars(["x", "y"], errors="ignore"),
-        lambda_x=lam,
-        lambda_y=lam * 1.1,
-    )
-    out.attrs["cart_factors"] = json.dumps(
-        {"x": ["rho_x", "lambda_x"], "y": ["rho_y", "lambda_y"]}
-    )
-    return out
-
-
-@pytest.fixture
-def materialised(factored):
-    """The same moving grid with its cartesian coordinates written out in full."""
-    return factored.assign_coords(
-        x=(factored.rho_x * factored.lambda_x).transpose("t", "a1", "a2"),
-        y=(factored.rho_y * factored.lambda_y).transpose("t", "a1", "a2"),
-    )
 
 
 # --- helpers ----------------------------------------------------------------------------------
@@ -230,7 +192,7 @@ def test_string_cart_axes_draw_against_parameter_dims():
         coords={"dB0": dB, "lambda": lam},
         name="sig",
     )
-    assert plotting._spatial_dims(data) == []
+    assert lattice_dims(data) == []
     assert plotting._aligned_axes(data, []) == []
 
     shown, mesh, sliders, _ = draw_map(data, ["lambda", "dB0"])
@@ -317,12 +279,12 @@ def test_quiver_draws_on_its_default_axes(aligned2d):
 
 @pytest.mark.parametrize("helper", ["map", "line", "quiver"])
 def test_every_helper_reads_a_factored_frame(factored, helper):
-    """Only create_map used to pass the factors on to '_moving_dims'.
+    """Only create_map used to pass the factors on to the moving-grid check.
 
     Without them the field does not look like a moving grid at all, so the other two fell into
     the orthogonal path and went looking for cartesian coordinates that were deliberately never
-    materialised. Every helper now recognises the recipe, so a rescaling run can be drawn as a
-    line or a quiver and not only as a map.
+    materialised. Every helper now reads the frame through the 'frames' module, so a factored
+    grid can be drawn as a line or a quiver and not only as a map.
     """
     fig, ax = plt.subplots()
     try:
@@ -421,6 +383,34 @@ def test_plot_eigenvector_mixes_axes_and_shares_sliders(param2d):
         assert axes[0][1].lines, "cell 1 draws a line"
     finally:
         plt.close(fig)
+
+
+def test_plot_eigenvector_asks_the_potential_for_its_layer(param2d):
+    """The overlay is whatever the potential says it looks like from the field, not its '.V'.
+
+    Reading '.V' directly drew only the static part of a time-dependent potential, and an empty
+    placeholder for one that has no grid of its own. Going through 'sample_on' lets a subclass
+    answer for itself, with the very field it is drawn with; a bare DataArray is drawn as it is.
+    """
+
+    class Asked(Potential):
+        def sample_on(self, field=None):
+            self.asked = field
+            return field * 0 + 1 + field  # a layer that cannot be mistaken for V, which is all 0
+
+    pot = Asked(unitvecs=[[8, 0], [0, 10]], resolution=(NA1, NA2), v0=0)
+    field = param2d.V
+    for overlay in (pot, field * 2):
+        fig, axes = plot_eigenvector(
+            [[field, field]], [[overlay, overlay]], cart_axes=[[[0, 1], [0]]]
+        )
+        try:
+            assert len(axes[0][0].collections) == 2, "the field's mesh and the potential's contours"
+            twins = [a for a in fig.axes if a not in (axes[0][0], axes[0][1])]
+            assert twins and twins[0].lines, "the potential's line, on its own y-axis"
+        finally:
+            plt.close(fig)
+    assert pot.asked is field
 
 
 @pytest.mark.parametrize(
@@ -524,19 +514,6 @@ def test_options_must_be_passed_by_keyword(aligned2d, call):
             call(fig, ax, aligned2d.V)
     finally:
         plt.close(fig)
-
-
-def test_cart_extent_matches_the_materialised_product(factored, materialised):
-    """The span of a factored coordinate is taken from its factors, never by multiplying them out.
-
-    Building the product to measure it would cost exactly the array the factored form exists to
-    avoid, so the corners of the factors are used instead. That shortcut is only worth anything
-    if it gives the same answer, which is what this checks.
-    """
-    for name in ("x", "y"):
-        lean = plotting._cart_extent(factored, name, FACTORS)
-        full = plotting._cart_extent(materialised, name, {})
-        assert lean == pytest.approx(full)
 
 
 @pytest.mark.parametrize("field", ["factored", "materialised"])

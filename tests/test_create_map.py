@@ -11,12 +11,10 @@ import pytest
 import xarray as xr
 
 import bloch_schrodinger.plotting as plotting
+from bloch_schrodinger.frames import lattice_dims, set_cart_factors
 from bloch_schrodinger.plotting import (
     _aligned_axes,
-    _cart_at,
-    _cart_factors,
     _rank1_axis,
-    _spatial_dims,
     create_map,
 )
 from bloch_schrodinger.potential import Potential
@@ -44,7 +42,7 @@ def moving():
     lam = 1 + 0.7 * t
     field = np.exp(-(rho_x**2 + rho_y**2) / 4) * (1 + 0 * t)
     field = field.transpose("t", "a1", "a2").rename("f")
-    # dropped exactly as a run saved with store_frame=False does: the frame lives in the factors
+    # the cartesian coordinates are dropped, and the frame lives in its factors instead
     return field.drop_vars(["x", "y"]).assign_coords(
         rho_x=rho_x.drop_vars(["x", "y"], errors="ignore"),
         rho_y=rho_y.drop_vars(["x", "y"], errors="ignore"),
@@ -79,7 +77,7 @@ def test_rank1_axis_finds_the_only_axis_that_varies():
 
 
 def test_axis_aligned_lattice_needs_no_interpolation(aligned3d):
-    assert _aligned_axes(aligned3d, _spatial_dims(aligned3d)) == [0, 1, 2]
+    assert _aligned_axes(aligned3d, lattice_dims(aligned3d)) == [0, 1, 2]
 
 
 def test_skewed_lattice_is_still_interpolated():
@@ -88,12 +86,12 @@ def test_skewed_lattice_is_still_interpolated():
         unitvecs=[[a * 3**0.5 / 2, -a / 2], [a * 3**0.5 / 2, a / 2]],
         resolution=(16, 16), v0=0,
     )
-    assert _aligned_axes(pot.V, _spatial_dims(pot.V)) is None
+    assert _aligned_axes(pot.V, lattice_dims(pot.V)) is None
 
 
 def test_permuted_box_reports_the_permutation():
     pot = Potential(unitvecs=[[0, 20], [15, 0]], resolution=(8, 10), v0=0)
-    assert _aligned_axes(pot.V, _spatial_dims(pot.V)) == [1, 0]
+    assert _aligned_axes(pot.V, lattice_dims(pot.V)) == [1, 0]
 
 
 def test_aligned_field_does_not_call_interp(aligned3d, monkeypatch):
@@ -158,40 +156,16 @@ def test_mesh_spans_the_right_cartesian_coordinate(aligned3d, cart_axes):
 
 # --- a frame stored as factors ---------------------------------------------------------------
 
-def test_factors_are_read_from_the_array(moving):
-    tagged = moving.copy()
-    tagged.attrs["cart_factors"] = '{"x": ["rho_x", "lambda_x"]}'
-    assert _cart_factors(tagged) == {"x": ["rho_x", "lambda_x"]}
-    assert _cart_factors(moving) == {}
-    assert _cart_factors(moving, {"x": ("a", "b")}) == {"x": ("a", "b")}
-
-
-def test_factored_coordinate_matches_the_materialised_one(moving):
-    factors = {"x": ("rho_x", "lambda_x"), "y": ("rho_y", "lambda_y")}
-    sel = {"t": float(moving.t[2])}
-    rebuilt = _cart_at(moving, "x", factors, sel)
-    direct = (moving.coords["rho_x"] * moving.coords["lambda_x"]).sel(sel, method="nearest")
-    assert np.array_equal(
-        rebuilt.transpose("a1", "a2").values, direct.transpose("a1", "a2").values
-    )
-
-
 def test_factored_frame_draws_the_same_as_a_materialised_one(moving):
     factors = {"x": ("rho_x", "lambda_x"), "y": ("rho_y", "lambda_y")}
     materialised = moving.assign_coords(
         x=(moving.coords["rho_x"] * moving.coords["lambda_x"]).transpose("t", "a1", "a2"),
         y=(moving.coords["rho_y"] * moving.coords["lambda_y"]).transpose("t", "a1", "a2"),
     )
-    lean_vals, lean_mesh, _, _ = draw(moving, [0, 1], frame=factors)
+    lean_vals, lean_mesh, _, _ = draw(set_cart_factors(moving, factors), [0, 1])
     full_vals, full_mesh, _, _ = draw(materialised, [0, 1])
     assert np.array_equal(np.asarray(lean_vals), np.asarray(full_vals))
     assert np.array_equal(lean_mesh, full_mesh)
-
-
-def test_factored_frame_is_recognised_as_moving(moving):
-    factors = {"x": ("rho_x", "lambda_x"), "y": ("rho_y", "lambda_y")}
-    assert plotting._moving_dims(moving, "x", ["a1", "a2"], factors) == ["t"]
-    assert plotting._cart_dims(moving, "x", factors) == ("a1", "a2", "t")
 
 
 # --- how much gets evaluated -----------------------------------------------------------------
@@ -246,7 +220,9 @@ def test_moving_grid_mesh_follows_the_frame(moving):
 
     fig, ax = plt.subplots()
     try:
-        sliders, update, _ = create_map(fig, ax, [0, 1], moving, "pcolormesh", frame=factors)
+        sliders, update, _ = create_map(
+            fig, ax, [0, 1], set_cart_factors(moving, factors), "pcolormesh"
+        )
         values = {k: w.value for k, w in sliders.items()}
         values["t"] = float(moving.t[0])
         update(**values)
