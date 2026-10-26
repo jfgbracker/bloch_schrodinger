@@ -7,6 +7,13 @@ from ipywidgets import FloatSlider, IntSlider
 ### ====================
 ### Sliders
 ### ====================
+
+# Whether sliders redraw while being dragged, rather than once on release. Off by default: every
+# drag step is a full update and redraw, the kernel queues them faster than it can serve them, and
+# a single drag over a large field keeps it busy -- and deaf to interrupts -- for a long while.
+# Read when a slider is built, so setting it to True re-enables live scrubbing for later plots.
+CONTINUOUS_UPDATE = False
+
 def islinspace(arr: xr.DataArray) -> tuple[bool, float]:
     """Checks wether a coordinate array is regularily spaced, and return a boolean and the step size.
 
@@ -54,6 +61,7 @@ def create_sliders(
                 else step,
                 value=float(val),
                 description=dim,
+                continuous_update=CONTINUOUS_UPDATE,
             )
         else:
             sliders_ax[dim] = IntSlider(
@@ -62,6 +70,7 @@ def create_sliders(
                 step=1 if not islin else step,
                 value=val,
                 description=dim,
+                continuous_update=CONTINUOUS_UPDATE,
             )
     return sliders_ax
 
@@ -96,6 +105,7 @@ def create_sliders_from_dims(
                 else step,
                 value=float(val),
                 description=dim,
+                continuous_update=CONTINUOUS_UPDATE,
             )
         else:
             sliders_ax[dim] = IntSlider(
@@ -104,6 +114,7 @@ def create_sliders_from_dims(
                 step=1 if not islin else step,
                 value=val,
                 description=dim,
+                continuous_update=CONTINUOUS_UPDATE,
             )
     return sliders_ax
 

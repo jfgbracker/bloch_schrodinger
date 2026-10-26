@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 import xarray as xr
 from cmcrameri import cm
 from IPython.display import display
-from ipywidgets import FloatSlider, HBox, VBox, interactive_output
+from ipywidgets import FloatSlider, HBox, VBox, Widget, interactive_output
 from matplotlib import colors
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
@@ -19,6 +19,7 @@ from matplotlib.gridspec import GridSpec
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from skimage.measure import marching_cubes
 
+from bloch_schrodinger import utils
 from bloch_schrodinger.frames import (
     cart_coord,
     cart_dims,
@@ -385,6 +386,89 @@ def _potential_layer(
     if potential is None or isinstance(potential, xr.DataArray):
         return potential
     return potential.sample_on(like)
+
+
+# How many interactive plots keep working sliders at once. A live plot pins everything its update
+# reaches -- the field it draws, and through a lazy field the whole sweep behind it -- and nothing
+# else ever lets go of it: the sliders sit in ipywidgets' registry until closed, and a figure
+# closed by 'plt.close' does not close them. Re-running plotting cells used to grow the kernel
+# until it swapped. Past this many, the oldest plot's controls are closed; its figure stays up,
+# showing its last frame, but no longer follows the sliders.
+MAX_LIVE_PLOTS = 4
+
+
+@dataclass(eq=False)
+class _LivePlot:
+    """An interactive plot still holding its data: its figure and the widgets driving it."""
+
+    figure: Figure | go.FigureWidget
+    widgets: list[Widget]
+
+
+_live: list[_LivePlot] = []
+
+
+def _retire(plot: _LivePlot, close_figure: bool = False):
+    """Close a plot's controls, which is what releases its data, and optionally its figure.
+
+    Safe to call more than once, since closing the figure itself comes back here.
+    """
+    if plot in _live:
+        _live.remove(plot)
+    widgets, plot.widgets = plot.widgets, []
+    for w in widgets:
+        w.close()
+    if close_figure:
+        if isinstance(plot.figure, Figure):
+            plt.close(plot.figure)
+        else:
+            plot.figure.close()
+
+
+def close_all():
+    """Close every interactive plot still live, figures included, and release their data."""
+    for plot in list(_live):
+        _retire(plot, close_figure=True)
+
+
+def _show_controls(
+    figure: Figure | go.FigureWidget,
+    controls: dict,
+    update: Callable,
+    rows: list[Widget] | None = None,
+):
+    """Wire the controls to 'update', display them, and keep track of the plot they drive.
+
+    Args:
+        figure (Figure or go.FigureWidget): The figure the controls drive.
+        controls (dict): Name -> widget, as 'interactive_output' takes them.
+        update (Callable): Called with the controls' values whenever one changes.
+        rows (list[Widget], optional): A layout for the controls, if not one per line. Defaults
+            to None.
+    """
+    out = interactive_output(update, controls)
+    rows = list(rows) if rows else []
+    box = VBox((rows or list(controls.values())) + [out])
+    display(box)
+
+    plot = _LivePlot(figure, [*controls.values(), *rows, out, box])
+    _live.append(plot)
+    while len(_live) > MAX_LIVE_PLOTS:
+        _retire(_live[0])
+
+    # Closing the figure frees its data too. A GUI backend reports it as a close_event; ipympl
+    # and plotly figures are widgets, and 'plt.close' closes ipympl's canvas without one, so for
+    # those it is the widget's comm going away that says so.
+    def on_close(*_):
+        _retire(plot)
+
+    widget = figure if isinstance(figure, Widget) else getattr(figure, "canvas", None)
+    if isinstance(figure, Figure):
+        figure.canvas.mpl_connect("close_event", on_close)
+    if isinstance(widget, Widget):
+        widget.observe(
+            lambda change: change["new"] is None and on_close(), names="comm"
+        )
 
 
 font = {"family": "serif", "size": 12, "serif": "cmr10"}
@@ -938,9 +1022,7 @@ def plot_cuts(
         if ymin is None and ymax is None:
             ax.set_ylim(new_bands.min() - pad, new_bands.max() + pad)
 
-    out = interactive_output(update, sliders)
-    # Display everything
-    display(VBox(list(sliders.values()) + [out]))
+    _show_controls(fig, sliders, update)
     return fig, ax
 
 
@@ -989,6 +1071,7 @@ def energy_levels(
         max=cut_coord[-1],
         step=(cut_coord[-1] - cut_coord[0]) // res,
         description="offset",
+        continuous_update=utils.CONTINUOUS_UPDATE,
     )
 
     slider_rot = FloatSlider(
@@ -997,6 +1080,7 @@ def energy_levels(
         max=np.pi * 2,
         step=np.pi / 100,
         description="cut rotation (rad)",
+        continuous_update=utils.CONTINUOUS_UPDATE,
     )
 
     x_coord, y_coord = (
@@ -1102,9 +1186,12 @@ def energy_levels(
                 eigve_slice.z, eigve_slice.sel(band=b), new_eigva.sel(band=b)
             )
 
-    out = interactive_output(update, {**sliders, "y": slider_y, "rot": slider_rot})
-    # Display everything
-    display(VBox([HBox(list(sliders.values())), HBox([slider_y, slider_rot]), out]))
+    _show_controls(
+        fig,
+        {**sliders, "y": slider_y, "rot": slider_rot},
+        update,
+        rows=[HBox(list(sliders.values())), HBox([slider_y, slider_rot])],
+    )
     return fig, ax
 
 
@@ -1240,9 +1327,7 @@ def dashboard(
         update_bands(**kwargs)
         fig.canvas.draw_idle()
 
-    out = interactive_output(update, sliders)
-    # Display everything
-    display(VBox(list(sliders.values()) + [out]))
+    _show_controls(fig, sliders, update)
     return fig, ax
 
 
@@ -1767,7 +1852,12 @@ def plot_isosurface(
         )
     )
     iso_slider = FloatSlider(
-        value=isovalue, min=0.01, max=0.99, step=0.01, description="isovalue"
+        value=isovalue,
+        min=0.01,
+        max=0.99,
+        step=0.01,
+        description="isovalue",
+        continuous_update=utils.CONTINUOUS_UPDATE,
     )
 
     def select(field: xr.DataArray, kwargs: dict) -> xr.DataArray:
@@ -1864,7 +1954,12 @@ def plot_isosurface(
         )
         pot_origin = (pot.x.values[0], pot.y.values[0], pot.z.values[0])
         pot_slider = FloatSlider(
-            value=0.3, min=0.01, max=0.99, step=0.01, description="V level"
+            value=0.3,
+            min=0.01,
+            max=0.99,
+            step=0.01,
+            description="V level",
+            continuous_update=utils.CONTINUOUS_UPDATE,
         )
         sliders.update(
             create_sliders_from_dims(
@@ -1969,11 +2064,10 @@ def plot_isosurface(
     if pot_slider is not None:
         controls["Vlevel"] = pot_slider
 
-    out = interactive_output(update, controls)
     # Only the controls are displayed here, the figure is the return value and so is rendered by the
     # notebook as the cell's result, just below them. Putting it in this VBox as well would show it
     # twice, since a FigureWidget handed back from a cell is displayed again.
-    display(VBox(list(controls.values()) + [out]))
+    _show_controls(fig, controls, update)
     return fig
 
 
@@ -2167,9 +2261,7 @@ def plot_eigenvector(
         for f in funcs:
             f(**kwargs)
 
-    out = interactive_output(update, sliders)
-    # Display everything
-    display(VBox(list(sliders.values()) + [out]))
+    _show_controls(fig, sliders, update)
     return fig, axes
 
 
