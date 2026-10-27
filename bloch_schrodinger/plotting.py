@@ -1,22 +1,31 @@
+import warnings
 from collections.abc import Callable
 from copy import deepcopy
+from dataclasses import dataclass
 from types import NoneType
 
 import matplotlib
 import matplotlib.pyplot as plt
-import json
-
 import numpy as np
 import xarray as xr
 from cmcrameri import cm
 from IPython.display import display
-from ipywidgets import FloatSlider, HBox, VBox, interactive_output
+from ipywidgets import FloatSlider, HBox, VBox, Widget, interactive_output
 from matplotlib import colors
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
+from bloch_schrodinger import utils
+from bloch_schrodinger.frames import (
+    cart_coord,
+    cart_dims,
+    cart_extent,
+    lattice_dims,
+    materialize,
+    moving_dims,
+)
 from bloch_schrodinger.lattice import LatticeGeometry, attach_lattice, resolve_geometry
 from bloch_schrodinger.potential import Potential
 from bloch_schrodinger.utils import (
@@ -26,14 +35,6 @@ from bloch_schrodinger.utils import (
 )
 
 coord_names = ["x", "y", "z"]
-
-
-def _spatial_dims(data: xr.DataArray) -> list[str]:
-    """Return the data's own lattice dims (a1, a2, ...), sorted by axis index."""
-    return sorted(
-        (d for d in data.dims if d[0] == "a" and d[1:].isdigit()),
-        key=lambda d: int(d[1:]),
-    )
 
 
 def _to_orthogonal(
@@ -114,72 +115,13 @@ def _aligned_axes(data: xr.DataArray, spatial_dims: list[str]) -> list[int] | No
     return axes if len(set(axes)) == len(axes) else None
 
 
-def _cart_factors(data: xr.DataArray, frame: dict | None = None) -> dict:
-    """The recipe for any cartesian coordinate stored as a product of other coordinates.
+def _axis_names(cart_axes: list) -> list[str]:
+    """The coordinate name each entry of 'cart_axes' refers to.
 
-    A moving frame is usually an outer product: a rescaling solver's grid is x = rho_x * lambda(t),
-    an invariant lattice times one number per time step. Stored as x itself that is an array the
-    size of the field; stored as its two factors it is a few kilobytes. This lets an array say so,
-    so the plotter can rebuild one frame at a time instead of being handed the whole product.
-
-    Nothing here knows what the factors mean or what they are called -- only that a coordinate may
-    be the product of others on the same array. The recipe comes from the explicit 'frame' argument
-    if given, else from the array's own 'cart_factors' attribute, which is JSON because netCDF
-    attributes cannot hold a mapping.
-
-    Args:
-        data (xr.DataArray): The field.
-        frame (dict, optional): An explicit recipe, e.g. {"x": ("rho_x", "lambda_x")}, overriding
-        whatever the array carries. Defaults to None.
-
-    Returns:
-        dict: Cartesian coordinate name -> the names of its factors. Empty when there are none.
+    An entry is either a cartesian axis index (0 = 'x', 1 = 'y', 2 = 'z') or, to plot a field
+    against its parameters rather than against space, the name of a dimension outright.
     """
-    if frame is not None:
-        return frame
-    raw = data.attrs.get("cart_factors")
-    if isinstance(raw, str):
-        return json.loads(raw)
-    return raw or {}
-
-
-def _cart_dims(data: xr.DataArray, name: str, factors: dict) -> tuple[str, ...]:
-    """The dims a cartesian coordinate depends on, whether it is stored or factored."""
-    if name in data.coords:
-        return tuple(data.coords[name].dims)
-    return tuple(
-        dict.fromkeys(d for part in factors[name] for d in data.coords[part].dims)
-    )
-
-
-def _cart_at(data: xr.DataArray, name: str, factors: dict, sel: dict) -> xr.DataArray:
-    """One frame of a cartesian coordinate, rebuilt from its factors when it is not stored.
-
-    Each factor is selected down to this frame *before* the product is taken. Multiplying first
-    would build the whole outer product -- the very array the factored form exists to avoid -- and
-    only then throw all but one frame of it away.
-
-    Args:
-        data (xr.DataArray): The field.
-        name (str): The cartesian coordinate wanted.
-        factors (dict): From '_cart_factors'.
-        sel (dict): The current slider position.
-
-    Returns:
-        xr.DataArray: The coordinate over the plotted lattice, for this frame.
-    """
-    def at(coord):
-        return coord.sel(
-            {d: v for d, v in sel.items() if d in coord.dims}, method="nearest"
-        )
-
-    if name in data.coords:
-        return at(data.coords[name])
-    out = None
-    for part in factors[name]:
-        piece = at(data.coords[part])
-        out = piece if out is None else out * piece
-    return out
+    return [coord_names[c] if isinstance(c, int) else c for c in cart_axes]
 
 
 def _relabel_cartesian(
@@ -216,21 +158,6 @@ def _relabel_cartesian(
     )
 
 
-def _moving_dims(
-    data: xr.DataArray, name: str, spatial_dims: list[str], factors: dict | None = None
-) -> list[str]:
-    """Return the non-spatial dims the cartesian coordinate 'name' depends on.
-
-    A field living on a moving grid -- the output of a rescaling solver, say -- carries cartesian
-    coordinates that are functions of the parameters, x(t, ...), rather than of the lattice alone.
-    An empty list means the grid is fixed and the coordinate can be read once and reused."""
-    return [
-        d
-        for d in _cart_dims(data, name, _cart_factors(data, factors))
-        if d not in spatial_dims
-    ]
-
-
 def _make_sliders(
     data: xr.DataArray,
     slider_dims: list[str],
@@ -251,6 +178,298 @@ def _make_sliders(
     }
 
 
+
+@dataclass(eq=False)
+class _Drawable:
+    """Everything the drawing helpers need to know about how a field maps onto a pair of axes.
+
+    'eq=False' matters: the generated __eq__ would compare DataArray fields elementwise and
+    return an array, which is not something a dataclass can use as a truth value.
+
+    Attributes:
+        data (xr.DataArray): The field, relabelled or interpolated onto cartesian axes where the
+            mode calls for it, and otherwise exactly as it was passed in.
+        mode (str): 'moving', 'ortho' or 'flat'. See '_prepare' for what each one means.
+        axes (list[str]): The coordinate names plotted against, in the order 'cart_axes' asked
+            for. Used for the axis labels and to look the mesh up.
+        plotted_dims (list[str]): The dims of 'data' that are drawn rather than sliced.
+        sliders (dict): One widget per dim that is not drawn.
+        mesh_at (Callable): sel -> one coordinate per plotted axis, at that slider position.
+        field_at (Callable): (array, sel) -> that array sliced to the frame and transposed to
+            match the mesh. It takes the array as an argument rather than closing over it, so
+            that a second field on the same lattice -- a quiver's V to its U -- can be pushed
+            through the same layout.
+        align (Callable): array -> the same relabelling or interpolation this layout applied to
+            'data', for a second field that has to end up on the same axes.
+    """
+
+    data: xr.DataArray
+    mode: str
+    axes: list[str]
+    plotted_dims: list[str]
+    sliders: dict
+    mesh_at: Callable
+    field_at: Callable
+    align: Callable
+
+
+def _prepare(
+    data: xr.DataArray,
+    cart_axes: list,
+    template: dict | None = None,
+    resolution: int | tuple[int] | None = None,
+) -> _Drawable:
+    """Work out how a field should be laid out on the given axes, without drawing anything.
+
+    This is the part 'create_map', 'create_line' and 'create_quiver' used to each carry their
+    own copy of, and the part they kept drifting apart on. There are three modes:
+
+    'moving' -- the cartesian coordinates depend on the parameters, because the grid itself moves
+    with them, so there is no single grid to interpolate onto: the field is drawn on its own
+    lattice and the mesh is rebuilt at each slider position. This also draws a skewed lattice as
+    the skewed cells it really is rather than smoothing over them.
+
+    'ortho' -- the axes asked for are not the field's own first two lattice axes, so it has to
+    be re-indexed by cartesian coordinate. An axis-aligned lattice is already a cartesian grid
+    wearing lattice labels, so that is an exact relabelling; only a genuinely skewed one, where
+    the cartesian and lattice axes really do mix, is worth interpolating. The difference is not
+    cosmetic: interpolating a swept 3-D run means tens of gigabytes of work to achieve what is
+    otherwise a transposition.
+
+    'flat' -- a static field drawn against its own leading lattice axes. The dense cartesian
+    coordinates are handed to matplotlib as the mesh, so a skewed lattice keeps its true shape
+    here too, and nothing is interpolated.
+
+    Nothing in here touches the field's values. Everything that would is deferred into the two
+    callables, so that one frame of a lazily-chunked sweep costs one frame's worth of work.
+
+    Args:
+        data (xr.DataArray): The field to lay out.
+        cart_axes (list): One entry per axis to draw against, either a cartesian axis index
+            (0 = 'x', 1 = 'y', 2 = 'z') or the name of a non-spatial dimension. One entry gives
+            a line, two give a map.
+        template (dict, optional): Consulted only for 'slider_start'. Defaults to None.
+        resolution (int or tuple[int], optional): The resolution to interpolate onto, when a
+            skewed lattice has to be. The field's own is used if None. Defaults to None.
+
+    Returns:
+        _Drawable: The layout.
+    """
+    spatial_dims = lattice_dims(data)
+    n_dims = len(spatial_dims)
+    n_axes = len(cart_axes)
+
+    # An entry may name a non-spatial dimension instead of a cartesian axis, which is how a
+    # field is plotted against two parameters rather than against space.
+    spatial_plot = any(isinstance(c, int) for c in cart_axes)
+    axes = _axis_names(cart_axes)
+
+    moving = bool(spatial_dims) and bool(moving_dims(data, axes[0]))
+    ortho = not moving and (list(cart_axes) != list(range(n_axes)) or n_dims != n_axes)
+
+    def align(arr: xr.DataArray) -> xr.DataArray:
+        return arr
+
+    if ortho:
+        aligned = _aligned_axes(data, spatial_dims)
+        if aligned is None:
+            def align(arr):
+                return _to_orthogonal(arr, lattice_dims(arr), resolution)
+        else:
+            def align(arr):
+                return _relabel_cartesian(arr, lattice_dims(arr), aligned)
+        data = align(data)
+
+    if not spatial_plot:
+        plotted_dims = list(axes)
+        leftover_spatial = [coord_names[d] for d in range(n_dims)] if ortho else []
+    elif moving:
+        # A slice through a leftover axis is a slice of constant lattice index, which is a plane
+        # of constant z only as long as the grid stays axis-aligned -- as one that only stretches
+        # along its own axes always is.
+        plotted_dims = [spatial_dims[c] for c in cart_axes]
+        leftover_spatial = [spatial_dims[d] for d in range(n_dims) if d not in cart_axes]
+    else:
+        plotted_dims = list(axes) if ortho else list(spatial_dims)
+        leftover_spatial = (
+            [coord_names[d] for d in range(n_dims) if d not in cart_axes] if ortho else []
+        )
+
+    slider_dims = [dim for dim in data.dims if dim not in plotted_dims]
+    sliders = _make_sliders(data, slider_dims, leftover_spatial, template or {})
+
+    # Held in the data's own dim order, which keeps the mesh and the field consistent with each
+    # other whatever order 'cart_axes' asked for.
+    mesh_dims = [d for d in data.dims if d in plotted_dims]
+
+    # matplotlib indexes the values as (Y, X). The ortho path relabels the dims to x, y and so
+    # can name that order outright; the moving path reorders both mesh and field onto the
+    # lattice and so agrees with itself. A static lattice drawn on its own a1, a2 guarantees
+    # neither -- the field keeps whatever order it was built in -- so the order is read back off
+    # the coordinates, last axis first.
+    gather: list[str] = []
+    for name in reversed(axes):
+        gather += [d for d in cart_dims(data, name) if d not in gather]
+    flat_dims = None if (ortho or moving) else tuple(gather[:n_axes])
+
+    mode = "moving" if moving else ("ortho" if ortho else "flat")
+    order = {
+        "ortho": tuple(reversed(axes)),
+        "moving": tuple(mesh_dims),
+        "flat": flat_dims,
+    }[mode]
+
+    def mesh_at(sel: dict) -> tuple[xr.DataArray, ...]:
+        """The mesh the field is drawn on, at one position of the sliders."""
+        out = []
+        for name in axes:
+            coord = cart_coord(data, name, sel)
+            out.append(coord.transpose(*mesh_dims) if moving else coord)
+        return tuple(out)
+
+    def field_at(arr: xr.DataArray, sel: dict) -> xr.DataArray:
+        """One frame of a field, transposed to sit on the mesh."""
+        frame_sel = {d: v for d, v in sel.items() if d in arr.dims}
+        return arr.sel(frame_sel, method="nearest").transpose(*order)
+
+    return _Drawable(
+        data=data,
+        mode=mode,
+        axes=axes,
+        plotted_dims=plotted_dims,
+        sliders=sliders,
+        mesh_at=mesh_at,
+        field_at=field_at,
+        align=align,
+    )
+
+
+def _pin_extent(ax: Axes, layout: _Drawable, cst_bds: bool):
+    """Pin the axes of a moving grid to the largest frame it reaches, when asked to.
+
+    Left to follow the frames, the limits refit around each one, so a grid that doubles in size
+    looks unchanged and only the tick labels give it away. Spanning every frame instead is what
+    makes the growth visible. A grid that does not move has one box either way, so this leaves it
+    alone.
+
+    Args:
+        ax (Axes): The axes to pin.
+        layout (_Drawable): The layout of the field drawn on them, from '_prepare'.
+        cst_bds (bool): Whether the caller asked for constant bounds at all.
+    """
+    if layout.mode != "moving" or not cst_bds:
+        return
+    ax.set_xlim(*cart_extent(layout.data, layout.axes[0]))
+    if len(layout.axes) > 1:
+        ax.set_ylim(*cart_extent(layout.data, layout.axes[1]))
+
+
+def _potential_layer(
+    potential: Potential | xr.DataArray | NoneType, like: xr.DataArray | NoneType
+) -> xr.DataArray | NoneType:
+    """The field to draw for a potential overlay, whatever form the potential was given in.
+
+    A DataArray is drawn as it is. Anything else is asked for its landscape as seen by 'like', the
+    field it is drawn with, through 'Potential.sample_on'. That way the plotting functions never
+    need to know whether they were handed a static landscape, one that depends on time, or one that
+    evaluates itself on a grid moving with the field. Reading '.V' directly, as they used to, drew
+    only the static part of the second and an empty placeholder for the third.
+
+    Args:
+        potential (Union[Potential, xr.DataArray, NoneType]): The potential, or None for no overlay.
+        like (Union[xr.DataArray, NoneType]): The field the overlay is drawn with, if any.
+
+    Returns:
+        Union[xr.DataArray, NoneType]: The landscape to draw, or None.
+    """
+    if potential is None or isinstance(potential, xr.DataArray):
+        return potential
+    return potential.sample_on(like)
+
+
+# How many interactive plots keep working sliders at once. A live plot pins everything its update
+# reaches -- the field it draws, and through a lazy field the whole sweep behind it -- and nothing
+# else ever lets go of it: the sliders sit in ipywidgets' registry until closed, and a figure
+# closed by 'plt.close' does not close them. Re-running plotting cells used to grow the kernel
+# until it swapped. Past this many, the oldest plot's controls are closed; its figure stays up,
+# showing its last frame, but no longer follows the sliders.
+MAX_LIVE_PLOTS = 4
+
+
+@dataclass(eq=False)
+class _LivePlot:
+    """An interactive plot still holding its data: its figure and the widgets driving it."""
+
+    figure: "Figure | go.FigureWidget"
+    widgets: list[Widget]
+
+
+_live: list[_LivePlot] = []
+
+
+def _retire(plot: _LivePlot, close_figure: bool = False):
+    """Close a plot's controls, which is what releases its data, and optionally its figure.
+
+    Safe to call more than once, since closing the figure itself comes back here.
+    """
+    if plot in _live:
+        _live.remove(plot)
+    widgets, plot.widgets = plot.widgets, []
+    for w in widgets:
+        w.close()
+    if close_figure:
+        if isinstance(plot.figure, Figure):
+            plt.close(plot.figure)
+        else:
+            plot.figure.close()
+
+
+def close_all():
+    """Close every interactive plot still live, figures included, and release their data."""
+    for plot in list(_live):
+        _retire(plot, close_figure=True)
+
+
+def _show_controls(
+    figure: "Figure | go.FigureWidget",
+    controls: dict,
+    update: Callable,
+    rows: list[Widget] | None = None,
+):
+    """Wire the controls to 'update', display them, and keep track of the plot they drive.
+
+    Args:
+        figure (Figure or go.FigureWidget): The figure the controls drive.
+        controls (dict): Name -> widget, as 'interactive_output' takes them.
+        update (Callable): Called with the controls' values whenever one changes.
+        rows (list[Widget], optional): A layout for the controls, if not one per line. Defaults
+            to None.
+    """
+    out = interactive_output(update, controls)
+    rows = list(rows) if rows else []
+    box = VBox((rows or list(controls.values())) + [out])
+    display(box)
+
+    plot = _LivePlot(figure, [*controls.values(), *rows, out, box])
+    _live.append(plot)
+    while len(_live) > MAX_LIVE_PLOTS:
+        _retire(_live[0])
+
+    # Closing the figure frees its data too. A GUI backend reports it as a close_event; ipympl
+    # and plotly figures are widgets, and 'plt.close' closes ipympl's canvas without one, so for
+    # those it is the widget's comm going away that says so.
+    def on_close(*_):
+        _retire(plot)
+
+    widget = figure if isinstance(figure, Widget) else getattr(figure, "canvas", None)
+    if isinstance(figure, Figure):
+        figure.canvas.mpl_connect("close_event", on_close)
+    if isinstance(widget, Widget):
+        widget.observe(
+            lambda change: change["new"] is None and on_close(), names="comm"
+        )
+
+
 font = {"family": "serif", "size": 12, "serif": "cmr10"}
 
 matplotlib.rc("font", **font)
@@ -258,29 +477,46 @@ matplotlib.rcParams["mathtext.fontset"] = "cm"
 matplotlib.rcParams["font.family"] = "STIXGeneral"
 
 
-def contour_tmpl(lvls: int | np.ndarray = 3) -> dict:
-    """Return a simple contour plot template for general purpose use.
+def contour_tmpl(
+    lvls: int | np.ndarray = 3,
+    *,
+    colors: str | np.ndarray = "gray",
+    linewidths: float = 0.5,
+    linestyles: str = "dashed",
+) -> dict:
+    """Return a contour-line template, for overlaying an outline on a filled map.
 
     Args:
-        lvls (Union[int, np.ndarray]): If an integer, the number of contour levels, if an array, each entry specifies the height of a level.
+        lvls (int or np.ndarray): If an integer, the number of contour levels; if an array, the
+        height of each level.
+        colors (str or np.ndarray, optional): The line colour, or one colour per level. Defaults
+        to "gray".
+        linewidths (float, optional): Defaults to 0.5.
+        linestyles (str, optional): Defaults to "dashed".
+
     Returns:
-        dict
+        dict: The template.
     """
     return {
         "fkwargs": {
             "levels": lvls,
-            "colors": "gray",
-            "linewidths": 0.5,
-            "linestyles": "dashed",
+            "colors": colors,
+            "linewidths": linewidths,
+            "linestyles": linestyles,
         }
     }
 
 
-def quiver_tmpl() -> dict:
-    """Return a simple contour plot template for general purpose use.
+def quiver_tmpl(density: int = 2, **fkwargs) -> dict:
+    """Return an arrow-field template, for overlaying a vector field on a map.
+
+    Args:
+        density (int, optional): Keep every n-th arrow along each axis, to thin a crowded
+        field. Defaults to 2.
+        **fkwargs: Overrides passed on to Axes.quiver, e.g. color, scale, width, headwidth.
 
     Returns:
-        dict
+        dict: The template.
     """
     return {
         "fkwargs": {
@@ -289,79 +525,63 @@ def quiver_tmpl() -> dict:
             "scale_units": "width",
             "scale": 0.0003,
             "pivot": "mid",
+            **fkwargs,
         },
-        "density": 2,
+        "density": density,
     }
 
 
-def cmesh_tmpl(name: str) -> dict:
-    """Create simple prefiled templates for a pcolormesh object.
+def _cmesh_presets() -> dict[str, dict]:
+    """The colour-map presets, rebuilt on every call.
 
-    Args:
-        name (str): a template chosen between "amplitude", "amplitude - log", "real", "real - log" and "phase"
+    Built fresh rather than held in a module constant because a caller is handed the dict
+    itself and may well patch it, and because the norms are factories that get called once per
+    map. A shared constant would leak both.
 
-    Returns:
-        dict: _description_
+    The diverging presets use maps whose midpoint is a light neutral, so that zero reads as
+    nothing. A diverging map with a coloured or dark midpoint -- 'berlin', which 'real' used to
+    default to, has a midpoint of near-black -- makes zero look like an extreme value, which is
+    the opposite of what a signed quantity needs.
     """
-
-    if name == "amplitude":
-        temp = {
+    sci = {"format": "{x:.1e}"}
+    return {
+        "amplitude": {
             "fkwargs": {
                 "cmap": cm.oslo_r,
                 "rasterized": True,
-                "norm": lambda: (
-                    colors.Normalize()
-                ),  # using a factory function to avoid colormap sharing
+                "norm": lambda: colors.Normalize(),
             },
             "autoscale": True,
-            "colorbar": {"kwargs": {"format": "{x:.1e}"}},
-        }
-        return temp
-
-    if name == "amplitude - log":
-        temp = {
+            "colorbar": {"kwargs": dict(sci)},
+        },
+        "amplitude - log": {
             "fkwargs": {
                 "cmap": cm.oslo,
                 "rasterized": True,
-                "norm": lambda: (
-                    colors.LogNorm()
-                ),  # using a factory function to avoid colormap sharing
+                "norm": lambda: colors.LogNorm(),
             },
             "autoscale": True,
-            "colorbar": {"kwargs": {"format": "{x:.1e}"}},
-        }
-        return temp
-
-    if name == "real":
-        temp = {
+            "colorbar": {"kwargs": dict(sci)},
+        },
+        "real": {
             "fkwargs": {
-                "cmap": cm.berlin,
+                "cmap": cm.vik,
                 "rasterized": True,
-                "norm": lambda: (
-                    colors.CenteredNorm()
-                ),  # using a factory function to avoid colormap sharing
+                "norm": lambda: colors.CenteredNorm(),
             },
             "autoscale": True,
-            "colorbar": {"kwargs": {"format": "{x:.1e}"}},
-        }
-        return temp
-
-    if name == "real - log":
-        temp = {
+            "colorbar": {"kwargs": dict(sci)},
+        },
+        "real - log": {
             "fkwargs": {
-                "cmap": cm.berlin,
+                "cmap": cm.vik,
                 "rasterized": True,
-                "norm": lambda: colors.SymLogNorm(
-                    linthresh=1e-12
-                ),  # using a factory function to avoid colormap sharing
+                "norm": lambda: colors.SymLogNorm(linthresh=1e-12),
             },
             "autoscale": True,
-            "colorbar": {"kwargs": {"format": "{x:.1e}"}},
-        }
-        return temp
-
-    if name == "phase":
-        temp = {
+            "colorbar": {"kwargs": dict(sci)},
+        },
+        "phase": {
             "fkwargs": {
                 "cmap": "twilight",
                 "rasterized": True,
@@ -369,115 +589,364 @@ def cmesh_tmpl(name: str) -> dict:
                 "vmax": np.pi,
             },
             "colorbar": {
-                "kwargs": {
-                    "label": r"$\phi$",
-                },
+                "kwargs": {"label": r"$\phi$"},
                 "ticks": [-np.pi, 0, np.pi],
                 "tickslabel": [r"$-\pi$", "0", r"$\pi$"],
             },
-        }
-        return temp
+        },
+        "potential": {
+            "fkwargs": {
+                "cmap": cm.cork,
+                "rasterized": True,
+                "norm": lambda: colors.CenteredNorm(),
+            },
+            "autoscale": True,
+            "colorbar": {"kwargs": {"label": r"$V/E_r$", **sci}},
+        },
+        "difference": {
+            # For a difference the sign is the whole point, so the format carries one
+            "fkwargs": {
+                "cmap": cm.vik,
+                "rasterized": True,
+                "norm": lambda: colors.CenteredNorm(),
+            },
+            "autoscale": True,
+            "colorbar": {"kwargs": {"format": "{x:+.1e}"}},
+        },
+        "spin": {
+            "fkwargs": {
+                "cmap": cm.vik,
+                "rasterized": True,
+                "vmin": -1,
+                "vmax": 1,
+            },
+            "colorbar": {
+                "kwargs": {"label": r"$S_z$"},
+                "ticks": [-1, 0, 1],
+                "tickslabel": [r"$\sigma_-$", r"$\pi$", r"$\sigma_+$"],
+            },
+        },
+    }
+
+
+def cmesh_tmpl(
+    name: str,
+    *,
+    cmap: "str | colors.Colormap | None" = None,
+    label: str | None = None,
+    clim: tuple[float, float] | None = None,
+    fmt: str | None = None,
+    ticks: list | None = None,
+    tickslabel: list[str] | None = None,
+) -> dict:
+    """Return a prefilled template for a pcolormesh, contour or contourf.
+
+    The keyword arguments cover the tweaks that otherwise get made by patching the returned
+    dict, which is easy to get wrong and easy to do to a template that is shared between
+    subplots. Called with a name alone, this returns exactly what it always has.
+
+    Args:
+        name (str): One of 'amplitude', 'amplitude - log', 'real', 'real - log', 'phase',
+        'potential', 'difference' or 'spin'.
+        cmap (str or Colormap, optional): Replaces the preset's colormap. Defaults to None.
+        label (str, optional): The colorbar label. Defaults to None.
+        clim (tuple[float, float], optional): Fixed colour limits. Setting these also turns
+        'autoscale' off, since limits that are then rescaled away are no limits at all.
+        Defaults to None.
+        fmt (str, optional): The colorbar tick format, e.g. '{x:.2f}'. Defaults to None.
+        ticks (list, optional): Colorbar tick positions. Defaults to None.
+        tickslabel (list[str], optional): Colorbar tick labels, e.g. two poles rather than
+        three for a spin map. Defaults to None.
+
+    Returns:
+        dict: The template, safe to modify further.
+
+    Raises:
+        ValueError: If 'name' is not one of the presets. It used to return None instead, which
+        drew an unstyled plot and so made a mistyped name invisible.
+    """
+    presets = _cmesh_presets()
+    if name not in presets:
+        raise ValueError(
+            f"unknown template {name!r}; choose one of "
+            + ", ".join(repr(k) for k in presets)
+        )
+    temp = presets[name]
+
+    if cmap is not None:
+        temp["fkwargs"]["cmap"] = cmap
+    if clim is not None:
+        temp["clim"] = tuple(clim)
+        temp["autoscale"] = False
+    if any(v is not None for v in (label, fmt, ticks, tickslabel)):
+        colorbar = temp.setdefault("colorbar", {})
+        kwargs = colorbar.setdefault("kwargs", {})
+        if label is not None:
+            kwargs["label"] = label
+        if fmt is not None:
+            kwargs["format"] = fmt
+        if ticks is not None:
+            colorbar["ticks"] = list(ticks)
+        if tickslabel is not None:
+            colorbar["tickslabel"] = list(tickslabel)
+    return temp
+
+
+@dataclass(frozen=True)
+class LayerPair:
+    """Two templates for two passes over the *same* field: filled bands, then their outlines.
+
+    Deliberately not a tuple. 'plot_eigenvector' reads a 2-tuple template as
+    (field, potential-contour), so handing it a bare pair meant for one field would quietly
+    style the potential's contours with the outline instead. Unpacking still works, which is
+    how it is normally used:
+
+        filled, outline = signed_log_tmpl(6)
+    """
+
+    filled: dict
+    outline: dict
+
+    def __iter__(self):
+        yield self.filled
+        yield self.outline
+
+
+def signed_log_tmpl(
+    decades: int = 6,
+    *,
+    label: str | None = None,
+    cmap: "colors.Colormap | None" = None,
+    linewidths: float = 0.5,
+    outline: str = "k",
+) -> LayerPair:
+    """Return the pair of templates for a signed quantity spanning many decades.
+
+    A Wannier function is the case this exists for: it is signed, it decays over six or more
+    orders of magnitude, and both facts matter at once. Neither a linear scale, which shows
+    only the central lobe, nor a log scale, which throws the sign away, works. The answer is
+    discrete filled bands on a symmetric log ladder through zero, drawn in a diverging map with
+    the band straddling zero left white so that the tails read as empty rather than as small.
+
+    The field is expected to be normalised so that its extreme magnitude is one, as
+    'w / w.max()' gives; the ladder runs from ten-to-the-minus-decades-plus-one up to one.
+
+    Args:
+        decades (int, optional): How many decades each side of zero. Defaults to 6.
+        label (str, optional): The colorbar label. Defaults to None.
+        cmap (Colormap, optional): The diverging map the bands are drawn from. Defaults to cm.vik.
+        linewidths (float, optional): Width of the outlines. Defaults to 0.5.
+        outline (str, optional): Colour of the outlines. Defaults to "k".
+
+    Returns:
+        LayerPair: '.filled' for a 'contourf' pass and '.outline' for a 'contour' pass over the
+        same data, in that order. Both carry the same levels, which is what keeps the outlines
+        on the band edges.
+    """
+    if cmap is None:
+        cmap = cm.vik
+
+    magnitudes = np.logspace(-decades + 1, 0, decades)
+    levels = np.append(-magnitudes[::-1], magnitudes)
+
+    # One colour per *band*, of which there is one fewer than there are boundaries. Sampling the
+    # interior of the ramp this way reproduces the colours the hand-written version drew, which
+    # passed one colour too many and relied on matplotlib discarding the last.
+    band_colors = cmap(np.linspace(0, 1, 2 * decades + 1)[1:-1])
+    # The band straddling zero covers everything below the smallest decade, which is noise
+    band_colors[decades - 1] = [1, 1, 1, 1]
+
+    ticklabels = [rf"$-10^{{{-e}}}$" for e in range(decades)] + [
+        rf"$10^{{{e}}}$" for e in range(-decades + 1, 1)
+    ]
+    # ten to the zero is one, and reads better written that way
+    ticklabels[0], ticklabels[-1] = "$-1$", "$1$"
+
+    filled = {
+        "fkwargs": {"levels": levels, "colors": band_colors},
+        "colorbar": {"kwargs": {}, "ticks": levels, "tickslabel": ticklabels},
+    }
+    if label is not None:
+        filled["colorbar"]["kwargs"]["label"] = label
+
+    return LayerPair(
+        filled,
+        {
+            "fkwargs": {
+                "levels": levels,
+                "colors": outline,
+                "linestyles": "solid",
+                "linewidths": linewidths,
+            }
+        },
+    )
+
+
+def _apply_axes(ax: Axes, spec: dict | None):
+    """Apply a template's 'axes' section: the labels and aspect otherwise set by hand.
+
+    Applied once, at setup, because none of it changes as the sliders move. Axis *limits* are
+    deliberately not part of this: on a moving grid the limits are the one thing the drawing
+    helpers manage themselves, frame by frame or spanned across the whole run, and a template
+    setting them as well would mean two rules for one property.
+
+    Args:
+        ax (Axes): The axes to label.
+        spec (dict, optional): The 'axes' entry, with any of 'xlabel', 'ylabel' and 'aspect'.
+    """
+    if not spec:
+        return
+    if spec.get("xlabel") is not None:
+        ax.set_xlabel(spec["xlabel"])
+    if spec.get("ylabel") is not None:
+        ax.set_ylabel(spec["ylabel"])
+    if spec.get("aspect") is not None:
+        ax.set_aspect(spec["aspect"])
+
+
+def _prepare_template(template: dict | None) -> dict:
+    """A private, ready-to-draw copy of a template.
+
+    Templates are built once and handed to several subplots, so nothing here may touch the
+    caller's dict. 'create_map' used to write its 'fkwargs' default straight into whatever it
+    was given, which polluted the shared mutable default of every call that passed no template
+    at all.
+
+    The norm is carried as a factory for the same reason: two maps sharing one Normalize share a
+    colour scale, so autoscaling one silently rescales the other. It is called here, once per
+    map, and the factory itself is left untouched for the next caller.
+
+    Args:
+        template (dict, optional): The template as the caller wrote it.
+
+    Returns:
+        dict: A deep copy, with 'fkwargs' present and its norm instantiated.
+    """
+    out = deepcopy(template) if template else {}
+    if out.get("fkwargs") is None:
+        out["fkwargs"] = {}
+    norm = out["fkwargs"].get("norm")
+    # A Normalize is itself callable -- it maps values into 0..1 -- so a norm passed as an
+    # instance rather than as a factory would be called here with no arguments and raise a
+    # TypeError from deep inside matplotlib, naming nothing that would point a caller at the
+    # real problem. An instance needs no calling anyway: the deepcopy above already gave this
+    # template its own, so it cannot share a colour scale with anyone else either.
+    if callable(norm) and not isinstance(norm, colors.Normalize):
+        out["fkwargs"]["norm"] = norm()
+    return out
+
+
+def _add_colorbar(fig: Figure, ax: Axes, obj, colorbar: dict | None):
+    """Attach a colorbar in its own axes beside 'ax', as a template's 'colorbar' entry asks.
+
+    The bar gets an axes of its own rather than stealing space from 'ax', so that a row of
+    subplots keeps its panels the same size whether or not they carry one.
+
+    Args:
+        fig (Figure): The figure the bar belongs to.
+        ax (Axes): The axes to hang it beside.
+        obj: The artist whose colour scale it describes.
+        colorbar (dict, optional): The template's 'colorbar' entry. None or empty draws none.
+
+    Returns:
+        Colorbar or None: The bar, or None when the template asked for none.
+    """
+    if not colorbar:
+        return None
+    cax = make_axes_locatable(ax).append_axes(
+        **(colorbar.get("cax") or dict(position="right", size="5%", pad=0.05))
+    )
+    cbar = fig.colorbar(obj, cax=cax, **(colorbar.get("kwargs") or {"format": "{x:.1e}"}))
+    if colorbar.get("tickslabel"):
+        cbar.set_ticks(colorbar.get("ticks", cbar.ax.get_yticks()))
+        cbar.set_ticklabels(colorbar["tickslabel"])
+    return cbar
+
+
+def _remove_artist(obj):
+    """Take a drawn artist off its axes.
+
+    A contour set is a bundle of collections on older matplotlib and a single artist on newer
+    ones, and both forms are still met in the wild, so the removal has to cope with either.
+    """
+    if hasattr(obj, "collections"):
+        for coll in obj.collections:
+            coll.remove()
+    else:
+        obj.remove()
+
+
+def _format_template(
+    template: str | dict | tuple | NoneType, defaults: tuple[dict, ...]
+) -> tuple[dict, ...]:
+    """Expand whatever a caller wrote for one subplot into one template per layer.
+
+    A subplot is drawn in layers -- the field, the potential's contours, and for
+    'plot_eigenvector' the quiver on top -- and each wants its own template. Callers rarely want
+    to spell all of them out, so a bare string or dict styles the first layer and the rest fall
+    back to 'defaults'. The number of layers is taken from 'defaults', which is what lets
+    'dashboard' (two layers) and 'plot_eigenvector' (three) share this.
+
+    Args:
+        template: A style name, a template dict, a tuple of either, or None for no styling at all.
+        defaults (tuple[dict, ...]): One fallback per layer.
+
+    Returns:
+        tuple[dict, ...]: Exactly len(defaults) templates.
+
+    Raises:
+        ValueError: If 'template' is of an unusable type, or names more layers than there are.
+    """
+    n = len(defaults)
+    if template is None:
+        # Explicitly unstyled, which is not the same as omitted: no contours, no arrows either.
+        return tuple({} for _ in range(n))
+    if isinstance(template, str):
+        given = (cmesh_tmpl(template),)
+    elif isinstance(template, dict):
+        given = (template,)
+    elif isinstance(template, tuple):
+        head = template[:1]
+        given = tuple(
+            t if isinstance(t, dict) else cmesh_tmpl(t) for t in head
+        ) + tuple(template[1:])
+    elif isinstance(template, LayerPair):
+        raise ValueError(
+            "signed_log_tmpl returns two passes over the same field, not a field and a "
+            "potential contour, so it cannot be one template entry. Unpack it and make two "
+            "calls: filled, outline = signed_log_tmpl(...)"
+        )
+    else:
+        raise ValueError(
+            "Each template entry must be a string, a dict, a tuple of those, or None; "
+            f"got {type(template).__name__}"
+        )
+    if len(given) > n:
+        raise ValueError(f"template has {len(given)} layers but only {n} are drawn")
+    return (*given, *defaults[len(given):])
 
 
 def get_template(name: str) -> dict:
-    """Return a pre-filled template made to be used with the 'plot_eigenvector' function. Includes the argument 'contourkwargs', 'pcolormeshkwargs',
-    'cbarkwargs' and 'quiverkwargs' that are passed to the according matplotlib functions.
+    """Deprecated. Return a template for 'plot_eigenvector'; use 'cmesh_tmpl' instead.
+
+    This used to return a different, older template format, with 'colormap', 'pcolormeshkwargs'
+    and 'contourkwargs' keys. Nothing has read that format since the templates were reorganised
+    around 'fkwargs', so a template built here silently drew unstyled. It now delegates to
+    'cmesh_tmpl', which both keeps old callers working and makes them work as they read.
 
     Args:
-        name (str): The name of the template, right now, 'amplitude', 'real', 'amplitude - log', 'real - log' and 'phase are implemented.
+        name (str): One of 'amplitude', 'amplitude - log', 'real', 'real - log' or 'phase'.
+
+    Returns:
+        dict: The template, in the current format.
     """
-
-    quivers = {
-        "color": "gray",
-        "width": 0.009,
-        "scale_units": "width",
-        "scale": 0.0003,
-        "pivot": "mid",
-        "density": 2,
-    }
-
-    contours = {
-        "levels": None,
-        "colors": "white",
-        "linewidths": 0.3,
-        "linestyles": "dashed",
-    }
-
-    if name == "amplitude":
-        temp = {
-            "colormap": cm.oslo_r,
-            "norm": lambda: (
-                colors.Normalize()
-            ),  # using a factory function to avoid colormap sharing
-            "colorbarticks": None,
-            "autoscale": True,
-            "pcolormeshkwargs": {},
-            "contourkwargs": deepcopy(contours),
-            "cbarkwargs": {
-                "format": "{x:.1e}",
-            },
-            "quiverkwargs": deepcopy(quivers),
-        }
-        temp["contourkwargs"]["colors"] = "black"
-        return temp
-
-    if name == "amplitude - log":
-        temp = {
-            "colormap": cm.oslo,
-            "norm": lambda: colors.LogNorm(),
-            "colorbarticks": None,
-            "autoscale": True,
-            "pcolormeshkwargs": {},
-            "contourkwargs": deepcopy(contours),
-            "cbarkwargs": {
-                "format": "{x:.1e}",
-            },
-            "quiverkwargs": deepcopy(quivers),
-        }
-        return temp
-
-    if name == "real":
-        temp = {
-            "colormap": cm.berlin,
-            "norm": lambda: colors.CenteredNorm(),
-            "colorbarticks": None,
-            "autoscale": True,
-            "pcolormeshkwargs": {},
-            "contourkwargs": deepcopy(contours),
-            "cbarkwargs": {
-                "format": "{x:.1e}",
-            },
-            "quiverkwargs": deepcopy(quivers),
-        }
-        return temp
-
-    if name == "real - log":
-        temp = {
-            "colormap": cm.berlin,
-            "norm": lambda: colors.SymLogNorm(1e-12),
-            "colorbarticks": None,
-            "autoscale": True,
-            "pcolormeshkwargs": {},
-            "contourkwargs": deepcopy(contours),
-            "cbarkwargs": {
-                "format": "{x:.1e}",
-            },
-            "quiverkwargs": deepcopy(quivers),
-        }
-        return temp
-
-    if name == "phase":
-        temp = {
-            "colormap": "twilight",
-            "norm": lambda: colors.CenteredNorm(),
-            "clim": (-np.pi, np.pi),
-            "pcolormeshkwargs": {},
-            "contourkwargs": deepcopy(contours),
-            "cbarkwargs": {"label": r"$\phi$", "ticks": [-np.pi, 0, np.pi]},
-            "cbartickslabel": [r"$-\pi$", "0", r"$\pi$"],
-            "quiverkwargs": deepcopy(quivers),
-        }
-        return temp
+    warnings.warn(
+        "get_template is deprecated and now returns cmesh_tmpl's format; call cmesh_tmpl "
+        "directly instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return cmesh_tmpl(name)
 
 
 def plot_cuts(
@@ -555,9 +1024,7 @@ def plot_cuts(
         if ymin is None and ymax is None:
             ax.set_ylim(new_bands.min() - pad, new_bands.max() + pad)
 
-    out = interactive_output(update, sliders)
-    # Display everything
-    display(VBox(list(sliders.values()) + [out]))
+    _show_controls(fig, sliders, update)
     return fig, ax
 
 
@@ -606,6 +1073,7 @@ def energy_levels(
         max=cut_coord[-1],
         step=(cut_coord[-1] - cut_coord[0]) // res,
         description="offset",
+        continuous_update=utils.CONTINUOUS_UPDATE,
     )
 
     slider_rot = FloatSlider(
@@ -614,6 +1082,7 @@ def energy_levels(
         max=np.pi * 2,
         step=np.pi / 100,
         description="cut rotation (rad)",
+        continuous_update=utils.CONTINUOUS_UPDATE,
     )
 
     x_coord, y_coord = (
@@ -719,9 +1188,12 @@ def energy_levels(
                 eigve_slice.z, eigve_slice.sel(band=b), new_eigva.sel(band=b)
             )
 
-    out = interactive_output(update, {**sliders, "y": slider_y, "rot": slider_rot})
-    # Display everything
-    display(VBox([HBox(list(sliders.values())), HBox([slider_y, slider_rot]), out]))
+    _show_controls(
+        fig,
+        {**sliders, "y": slider_y, "rot": slider_rot},
+        update,
+        rows=[HBox(list(sliders.values())), HBox([slider_y, slider_rot])],
+    )
     return fig, ax
 
 
@@ -729,8 +1201,8 @@ def dashboard(
     eigva: xr.DataArray,
     eigvadim: str,
     eigveplots: list[list[NoneType | xr.DataArray]],
-    potential: Potential,
-    template: str | dict | tuple[str | dict],
+    potential: Potential | xr.DataArray | NoneType,
+    template: str | dict,
     titles: NoneType | list[list[NoneType | str]] = None,
     eigvawidth: int = 0.3,
     figkw: dict = {},
@@ -749,11 +1221,10 @@ def dashboard(
         eigvadim (str): The dimension to plot the eigenvalues against
         eigveplots (list[list[Union[NoneType,xr.DataArray]]]): A matrix representing the plot structure.
         The figure will consist of a panel showing the eigenvalues, and beside it an array of pcolormeshes with the structure specified by this matrix
-        potential (Potential): The potential for the contour overlay, only one needs to be given.
-        template (Union[str, dict, tuple]): The style of the eigenvector maps, shared by all of them. Either a preset name
-        (see 'cmesh_tmpl') or a colormesh template dict, both drawn with the default 'contour_tmpl()' overlay, or a tuple
-        (colormesh, contour) to style the potential contours as well. See 'create_map' for the keys of a template.
-        The maps never get a colorbar, whatever the template says.
+        potential (Union[Potential, xr.DataArray, NoneType]): The potential for the contour overlay, only one
+        needs to be given. A Potential is asked for its landscape through 'sample_on', as in
+        'plot_eigenvector'; None draws no overlay.
+        template (Union[str,dict]): A template to use for the colormesh, see doc of 'plot_eigenvector' and 'get_template' for more infos.
         titles (Union[NoneType, list[list[Union[NoneType,str]]]], optional): The titles, either a matrix with the same shape as plot_matrix, or None. Defaults to None.
         eigvawidth (int, optional): The fraction of the plot taken by the eigenvalue structure. Defaults to 0.3.
         figkw (dict, optional): A dictionary to pass to the figure constructor. Defaults to {}.
@@ -795,26 +1266,8 @@ def dashboard(
     # Rebound rather than extended: the sliders come from the create_map calls below
     sliders = {}
 
-    def make_tmpl(template: str | dict) -> dict:
-        """Check wheter template is a string or a dict, and if a str, create the proper dictionnary."""
-        return template if isinstance(template, dict) else cmesh_tmpl(template)
-
-    def format_template(template: str | dict | tuple[str | dict]) -> tuple[dict, dict]:
-        """Format a template input into the proper tuple"""
-        if isinstance(template, (str, dict)):
-            template = (make_tmpl(template), contour_tmpl())
-        elif not isinstance(template, tuple):
-            raise ValueError("The template must be a string, a dict or a tuple")
-        elif len(template) == 1:
-            ctmpl = make_tmpl(template[0])
-            template = (ctmpl, contour_tmpl())
-        elif len(template) == 2:
-            ctmpl = make_tmpl(template[0])
-            template = (ctmpl, template[1])
-        return template
-
-    template = format_template(template)
-    geometry = resolve_geometry(lattice, potential)
+    template = _format_template(template, ({}, contour_tmpl()))
+    geometry = resolve_geometry(lattice, potential if isinstance(potential, Potential) else None)
     if geometry is not None and sorted(cart_axes) != [0, 1]:
         raise ValueError("the lattice overlay needs x, y maps (cart_axes [0, 1] or [1, 0])")
     overlay_axes = []
@@ -824,10 +1277,10 @@ def dashboard(
             if eigveplots[i][j] is not None:
                 plot = eigveplots[i][j]
 
-                # The maps get no colorbar. Copied, so that the caller's own template is left untouched
+                # A copy, not the shared template: the dashboard draws its own colorbar and
+                # every subplot would otherwise switch the caller's off for good.
                 ctempl = {**template[0], "colorbar": None}
 
-                # The templates are passed by name: positionally, they would land in 'resolution'
                 ax = fig.add_subplot(gs_eigenvectors[i, j])
                 slider_ax, up, ax = create_map(
                     fig, ax, cart_axes, plot, "pcolormesh", template=ctempl
@@ -835,18 +1288,19 @@ def dashboard(
                 sliders.update(slider_ax)
                 funcs += [up]
 
-                if template[1] is not None:
+                layer = _potential_layer(potential, plot)
+                if layer is not None and template[1] is not None:
                     slider_ax, up, ax = create_map(
-                        fig, ax, cart_axes, potential.V, "contour", template=template[1]
+                        fig, ax, cart_axes, layer, "contour", template=template[1]
                     )
                     sliders.update(slider_ax)
                     funcs += [up]
-
-                co1, co2 = coord_names[cart_axes[0]], coord_names[cart_axes[1]]
-                ax.set_xlim(np.min(plot.coords[co1]), np.max(plot.coords[co1]))
-                ax.set_ylim(np.min(plot.coords[co2]), np.max(plot.coords[co2]))
                 if geometry is not None:
                     overlay_axes.append(ax)
+
+                co1, co2 = coord_names[cart_axes[0]], coord_names[cart_axes[1]]
+                ax.set_xlim(*cart_extent(plot, co1))
+                ax.set_ylim(*cart_extent(plot, co2))
                 ax.set_aspect("equal")
                 ax.xaxis.set_visible(False)
                 ax.yaxis.set_visible(False)
@@ -856,11 +1310,10 @@ def dashboard(
 
     if overlay_axes:
         start = {d: w.value for d, w in sliders.items()}
-        whole = potential if potential is not None and potential.n_dims == 2 else None
-        lkw = {**lattice_kwargs}
+        whole = potential if isinstance(potential, Potential) and potential.n_dims == 2 else None
         for oax in overlay_axes:
             funcs += [attach_lattice(oax, geometry, whole, start, swap_xy=list(cart_axes) == [1, 0],
-                                     **lkw).update]
+                                     **lattice_kwargs).update]
 
     # band plot
     ax = fig.add_subplot(gs_bands[0, 0])
@@ -897,9 +1350,7 @@ def dashboard(
         update_bands(**kwargs)
         fig.canvas.draw_idle()
 
-    out = interactive_output(update, sliders)
-    # Display everything
-    display(VBox(list(sliders.values()) + [out]))
+    _show_controls(fig, sliders, update)
     return fig, ax
 
 
@@ -909,24 +1360,31 @@ def create_map(
     cart_axes: list[int],
     data: xr.DataArray,
     method: str,
-    resolution:int|tuple[int] = None,
-    template: dict = {},
+    *,
+    resolution: int | tuple[int] = None,
+    template: dict = None,
     cst_bds: bool = False,
-    frame: dict | None = None,
 ) -> tuple[dict, Callable, Axes]:
-    """A low-level function to handle the creation of interactive 2D plots
+    """A low-level function to handle the creation of interactive 2D plots.
 
     Args:
         fig (Figure): The figure to plot the map in.
-        ax (Axes): The ax to plot the map in
-        cart_axes (list[int]): The two cartesian axes to plot against, with 0 = "x", 1 = "y" and 2 = "z".
-        If these aren't the data's own native a1,a2 axes (e.g. plotting x,z out of a 3D field, a flipped
-        axis order, or a skewed lattice), the data is first interpolated onto an orthogonal cartesian grid;
-        any spatial axis not selected then becomes an ordinary slider.
+        ax (Axes): The ax to plot the map in.
+        cart_axes (list[int]): The two axes to plot against, either cartesian axis indices with
+        0 = "x", 1 = "y" and 2 = "z", or the names of two non-spatial dimensions to plot a field
+        against its parameters instead of against space. If these aren't the data's own native
+        a1,a2 axes (e.g. plotting x,z out of a 3D field, a flipped axis order, or a skewed
+        lattice), the data is first re-indexed by cartesian coordinate; any spatial axis not
+        selected then becomes an ordinary slider. See '_prepare' for the three layouts.
         data (xr.DataArray): The data to plot. Its cartesian coordinates may depend on the parameters
-        as well as on the lattice, as a rescaling solver's do; the grid then moves with the sliders and
-        is redrawn at each of their positions rather than interpolated onto a common one.
+        as well as on the lattice, stored dense or as a product of factors (see the 'frames'
+        module); the grid then moves with the sliders and is redrawn at each of their positions
+        rather than interpolated onto a common one.
         method (str): Which matplotlib 2D plot function to use between 'pcolormesh', 'contour' and 'contourf'.
+        resolution (int or tuple[int], optional): The resolution of the cartesian grid the data is
+        interpolated onto, for the skewed lattices that need interpolating at all. A single int sets
+        the longest axis and the others follow in proportion; a tuple sets each. The data's own
+        resolution is used if None. Defaults to None.
         template (dict, optional): The template dictionnary contains all the instruction to create the plot. It has the following nested structure:
             template
                 ↳ fkwargs: keyword arguments for the plotting function defined by 'method'. default to {}
@@ -935,174 +1393,77 @@ def create_map(
                     ↳ cax: keyword arguments passed to the AxesDivider.append_axes function. Default to dict(position = 'right', size="5%", pad=0.05).
                     ↳ ticks: used to set manually the position of the colorbar ticks if necessary. Default to None.
                     ↳ tickslabel: used to set manually the text of the colorbar ticks if necessary. Default to None.
+                ↳ clim: fixed colour limits, reapplied after each redraw. Default to None.
                 ↳ slider_start: The initial position of the sliders. Default to 'left'.
                 ↳ autoscale: Wheter to autoscale the color range. Default to True.
-        cst_bds (bool, optional): Only meaningful on a moving grid. True keeps the axis limits fixed,
-        leaving the caller to set them (plot_eigenvector spans the largest frame); False makes them
-        follow the current frame, so the cloud keeps its apparent size while the axis labels change.
+            The dictionnary is copied before use, so one template can be shared between subplots.
+        cst_bds (bool, optional): Only meaningful on a moving grid. True pins the axes to the
+        largest frame the field reaches, so that the grid is seen to grow; False makes them follow
+        the current frame, so the field keeps its apparent size while the axis labels change.
         Defaults to False.
 
     Returns:
         tuple[dict, Callable, Axes]: A slider dictionnary, an update function for interactivity and the Axes object.
+
+    Raises:
+        ValueError: If 'cart_axes' does not have exactly two entries, or 'method' is not one of
+        the three supported ones.
     """
     if len(cart_axes) != 2:
         raise ValueError("create_map needs exactly 2 cart_axes")
 
-    if method == "pcolormesh":
-        func = Axes.pcolormesh
-    elif method == "contour":
-        func = Axes.contour
-    elif method == "contourf":
-        func = Axes.contourf
-    else:
+    funcs = {
+        "pcolormesh": Axes.pcolormesh,
+        "contour": Axes.contour,
+        "contourf": Axes.contourf,
+    }
+    if method not in funcs:
         raise ValueError(
             f"method must be 'pcolormesh', 'contour' or 'contourf', got {method!r}"
         )
+    func = funcs[method]
 
-    spatial_dims = _spatial_dims(data)
-    n_dims = len(spatial_dims)
-    dim1, dim2 = coord_names[cart_axes[0]], coord_names[cart_axes[1]]
-    factors = _cart_factors(data, frame)
+    layout = _prepare(data, cart_axes, template, resolution)
+    sliders = layout.sliders
+    template = _prepare_template(template)
 
-    # A moving grid is drawn on its own lattice instead of being interpolated onto a common cartesian
-    # one, because there is no common one to speak of: it changes with the sliders. pcolormesh takes
-    # the 2D X,Y mesh directly, so this handles any axis order and any number of dims on its own, and
-    # it draws a skewed lattice as the skewed cells it really is rather than smoothing over them.
-    moving = bool(_moving_dims(data, dim1, spatial_dims, factors))
-    ortho = not moving and (cart_axes != [0, 1] or n_dims != 2)
-    native = moving
-    if ortho:
-        # An axis-aligned lattice is already a cartesian grid wearing lattice labels, so getting
-        # to x, y, z is a relabelling and not an interpolation. Taking it exactly costs nothing and
-        # leaves everything downstream -- slider names, their physical values, the transposes --
-        # exactly as it was. Only a genuinely skewed lattice, where the cartesian and lattice axes
-        # really do mix, is worth interpolating.
-        aligned = _aligned_axes(data, spatial_dims)
-        if aligned is None:
-            data = _to_orthogonal(data, spatial_dims, resolution)
-        else:
-            data = _relabel_cartesian(data, spatial_dims, aligned)
+    def set_limits(X: xr.DataArray, Y: xr.DataArray):
+        """Fit the axes to the frame just drawn, unless they are pinned to the whole run."""
+        if layout.mode == "moving" and not cst_bds:
+            ax.set_xlim(float(X.min()), float(X.max()))
+            ax.set_ylim(float(Y.min()), float(Y.max()))
 
-    if moving:
-        # The slice through a leftover axis is a slice of constant lattice index, which is a plane of
-        # constant z only as long as the grid is axis-aligned -- as a rescaling solver's always is.
-        plotted_dims = [spatial_dims[d] for d in cart_axes]
-        leftover_spatial = [spatial_dims[d] for d in range(n_dims) if d not in cart_axes]
-    else:
-        plotted_dims = [dim1, dim2] if ortho else spatial_dims
-        leftover_spatial = (
-            [coord_names[d] for d in range(n_dims) if d not in cart_axes] if ortho else []
-        )
+    initial_sel = {dim: slider.value for dim, slider in sliders.items()}
+    X, Y = layout.mesh_at(initial_sel)
 
-    # Creating the sliders objects
-    slider_dims = [dim for dim in data.dims if dim not in plotted_dims]
-    sliders = _make_sliders(data, slider_dims, leftover_spatial, template)
-
-    # X, Y and the field are all held in the data's own dim order, which keeps them consistent with
-    # each other whatever order 'cart_axes' asked for
-    mesh_dims = [d for d in data.dims if d in plotted_dims]
-
-    def mesh_at(sel: dict) -> tuple[xr.DataArray, xr.DataArray]:
-        """The cartesian mesh the field is drawn on, at one position of the sliders."""
-        out = []
-        for name in (dim1, dim2):
-            coord = _cart_at(data, name, factors, sel)
-            out += [coord.transpose(*mesh_dims) if native else coord]
-        return out[0], out[1]
-
-    # Creating the fkwargs key just in case, to avoid testing its existence every time
-    if template.get("fkwargs") is None:
-        template["fkwargs"] = {}
-
-    # Initial parameter selections
-    initial_field_sel = {dim: sliders[dim].value for dim in sliders}
-
-    # Extracting the norm object from the template, it is convoluted to avoid unintended sharing of colorscales
-    template = deepcopy(
-        template
-    )  # We are going to mutate template so copying is important
-    if template.get("fkwargs"):
-        if template["fkwargs"].get("norm"):
-            template["fkwargs"]["norm"] = (
-                template["fkwargs"]["norm"]()
-                if callable(template["fkwargs"]["norm"])
-                else template["fkwargs"]["norm"]
-            )
-
-    # Shortcut names for the coordinates
-    X, Y = mesh_at(initial_field_sel)
-
-    # Initial data selection
-    plot_init = data.sel(initial_field_sel, method="nearest")
-    if ortho:
-        plot_init = plot_init.transpose(dim2, dim1)
-    elif native:
-        plot_init = plot_init.transpose(*mesh_dims)
-
-    obj = func(ax, X, Y, plot_init, **template["fkwargs"])
-    if moving and not cst_bds:
-        ax.set_xlim(float(X.min()), float(X.max()))
-        ax.set_ylim(float(Y.min()), float(Y.max()))
-    
+    obj = func(ax, X, Y, layout.field_at(layout.data, initial_sel), **template["fkwargs"])
+    set_limits(X, Y)
+    _pin_extent(ax, layout, cst_bds)
     if template.get("clim"):
         obj.set_clim(template["clim"][0], template["clim"][1])
+    _add_colorbar(fig, ax, obj, template.get("colorbar"))
+    _apply_axes(ax, template.get("axes"))
 
-    colorbar = template.get("colorbar")
-    if colorbar is not None:
-        if colorbar.get("kwargs") is None:
-            colorbar["kwargs"] = {"format": "{x:.1e}"}
-
-    cbar = None
-    if colorbar:
-        divider = make_axes_locatable(ax)
-        if colorbar.get("cax") is None:
-            colorbar["cax"] = dict(position="right", size="5%", pad=0.05)
-        cax = divider.append_axes(**colorbar["cax"])
-        cbar = fig.colorbar(
-            obj,
-            cax=cax,
-            **colorbar["kwargs"],
-        )
-        if colorbar.get("tickslabel"):
-            ticks = colorbar.get("ticks", cbar.ax.get_yticks())
-            cbar.set_ticks(ticks)
-            cbar.set_ticklabels(colorbar["tickslabel"])
+    # On a moving grid the mesh itself has to be rebuilt, so the artist cannot be updated in
+    # place even for a pcolormesh: its geometry, not just its values, is what changed. A contour
+    # set has no in-place update to speak of either. Everything else keeps its mesh -- slicing a
+    # leftover axis leaves the remaining coordinates exactly as they were -- so only the values
+    # need handing over.
+    redraws = layout.mode == "moving" or method in ("contour", "contourf")
 
     def update(**kwargs):
-
         nonlocal obj
         sel = {dim: kwargs[dim] for dim in sliders}
+        new_plot = layout.field_at(layout.data, sel)
+        newX, newY = layout.mesh_at(sel) if layout.mode == "moving" else (X, Y)
 
-        field_sel = {dim: value for dim, value in sel.items()}
-
-        new_plot = data.sel(field_sel, method="nearest")
-        if ortho:
-            new_plot = new_plot.transpose(dim2, dim1)
-        elif native:
-            new_plot = new_plot.transpose(*mesh_dims)
-
-        # On a moving grid the mesh itself has to be rebuilt, so the artist cannot be updated in
-        # place even for a pcolormesh: its geometry, not just its values, is what changed. An
-        # axis-aligned static lattice is the opposite case: its coordinates are rank-1, so slicing
-        # a leftover lattice axis leaves the mesh exactly as it was and the values can be set in
-        # place.
-        newX, newY = mesh_at(sel) if moving else (X, Y)
-        if moving or method in ["contour", "contourf"]:
-            if hasattr(obj, "collections"):
-                for coll in obj.collections:
-                    coll.remove()
-            else:
-                obj.remove()
-
+        if redraws:
+            _remove_artist(obj)
             obj = func(ax, newX, newY, new_plot, **template["fkwargs"])
-            # The artist the colorbar and the color limits were attached to no longer exists
+            # The artist the colour limits were attached to no longer exists
             if template.get("clim"):
                 obj.set_clim(template["clim"][0], template["clim"][1])
-            # if cbar is not None:
-            #     cbar.update_normal(obj)
-            if moving and not cst_bds:
-                ax.set_xlim(float(newX.min()), float(newX.max()))
-                ax.set_ylim(float(newY.min()), float(newY.max()))
+            set_limits(newX, newY)
         else:
             obj.set(array=new_plot.data.reshape(-1))
 
@@ -1119,9 +1480,10 @@ def create_line(
     ax: Axes,
     cart_axis: int,
     data: xr.DataArray,
-    template: dict = {},
+    *,
+    resolution: int | tuple[int] = None,
+    template: dict = None,
     cst_bds: bool = False,
-    resolution:int|tuple[int] = None,
 ) -> tuple[dict, Callable, Axes]:
     """A low-level function to handle the creation of interactive 1D line plots, the spatial analog of
     create_map for a single cartesian axis.
@@ -1129,75 +1491,43 @@ def create_line(
     Args:
         fig (Figure): The figure to plot the line in.
         ax (Axes): The ax to plot the line in.
-        cart_axis (int): The cartesian axis to plot against, with 0 = "x", 1 = "y" and 2 = "z".
+        cart_axis (int): The cartesian axis to plot against, with 0 = "x", 1 = "y" and 2 = "z",
+        or the name of a non-spatial dimension to plot against a parameter instead.
         data (xr.DataArray): The data to plot. As in create_map, its cartesian coordinate may depend on
         the parameters, in which case the abscissa moves with the sliders.
         template (dict, optional): Only 'fkwargs' (passed to ax.plot), 'slider_start' and 'autoscale' are used.
-        cst_bds (bool, optional): Only meaningful on a moving grid. False makes the x limits follow the
-        current frame. Defaults to False.
+        cst_bds (bool, optional): Only meaningful on a moving grid. True pins the x limits to the
+        largest frame the field reaches, False makes them follow the current frame. Defaults to
+        False.
+        resolution (int or tuple[int], optional): The resolution to interpolate onto, for a skewed
+        lattice that needs it. Defaults to None.
 
     Returns:
         tuple[dict, Callable, Axes]: A slider dictionnary, an update function for interactivity and the Axes object.
     """
-    spatial_dims = _spatial_dims(data)
-    n_dims = len(spatial_dims)
-    dim1 = coord_names[cart_axis]
+    layout = _prepare(data, [cart_axis], template, resolution)
+    sliders = layout.sliders
+    template = _prepare_template(template)
 
-    moving = bool(_moving_dims(data, dim1, spatial_dims))
-    ortho = not moving and n_dims != 1
-    if ortho:
-        # See 'create_map': an axis-aligned lattice is relabelled exactly rather than interpolated.
-        aligned = _aligned_axes(data, spatial_dims)
-        if aligned is None:
-            data = _to_orthogonal(data, spatial_dims, resolution)
-        else:
-            data = _relabel_cartesian(data, spatial_dims, aligned)
+    initial_sel = {dim: slider.value for dim, slider in sliders.items()}
+    (X,) = layout.mesh_at(initial_sel)
 
-    if moving:
-        plotted_dims = [spatial_dims[cart_axis]]
-        leftover_spatial = [
-            spatial_dims[d] for d in range(n_dims) if d != cart_axis
-        ]
-    else:
-        plotted_dims = [dim1] if ortho else spatial_dims
-        leftover_spatial = (
-            [coord_names[d] for d in range(n_dims) if d != cart_axis] if ortho else []
-        )
-
-    slider_dims = [dim for dim in data.dims if dim not in plotted_dims]
-    sliders = _make_sliders(data, slider_dims, leftover_spatial, template)
-
-    def abscissa_at(sel: dict) -> xr.DataArray:
-        """The cartesian abscissa the line is drawn against, at one position of the sliders."""
-        coord = data.coords[dim1]
-        if not moving:
-            return coord
-        return coord.sel(
-            {d: v for d, v in sel.items() if d in coord.dims}, method="nearest"
-        ).transpose(*plotted_dims)
-
-    template = deepcopy(template)
-    if template.get("fkwargs") is None:
-        template["fkwargs"] = {}
-
-    initial_field_sel = {dim: sliders[dim].value for dim in sliders}
-
-    X = abscissa_at(initial_field_sel)
-    plot_init = data.sel(initial_field_sel, method="nearest")
-    if moving:
-        plot_init = plot_init.transpose(*plotted_dims)
-
-    (line,) = ax.plot(X, plot_init, **template["fkwargs"])
-    if moving and not cst_bds:
+    (line,) = ax.plot(
+        X, layout.field_at(layout.data, initial_sel), **template["fkwargs"]
+    )
+    if layout.mode == "moving" and not cst_bds:
         ax.set_xlim(float(X.min()), float(X.max()))
+    _pin_extent(ax, layout, cst_bds)
+    _apply_axes(ax, template.get("axes"))
 
     def update(**kwargs):
         sel = {dim: kwargs[dim] for dim in sliders}
-        new_plot = data.sel(sel, method="nearest")
-        if moving:
+        new_plot = layout.field_at(layout.data, sel)
+
+        if layout.mode == "moving":
             # The abscissa moves too, so both halves of the line have to be handed over
-            newX = abscissa_at(sel)
-            line.set_data(newX.data, new_plot.transpose(*plotted_dims).data)
+            (newX,) = layout.mesh_at(sel)
+            line.set_data(newX.data, new_plot.data)
             if not cst_bds:
                 ax.set_xlim(float(newX.min()), float(newX.max()))
         else:
@@ -1218,168 +1548,86 @@ def create_quiver(
     cart_axes: list[int],
     dataU: xr.DataArray,
     dataV: xr.DataArray,
-    template: dict = quiver_tmpl(),
+    *,
+    resolution: int | tuple[int] = None,
+    template: dict = None,
+    cst_bds: bool = False,
 ) -> tuple[dict, Callable, Axes]:
-    """A low-level function to handle the creation of interactive 2D plots using the quiver functions
+    """A low-level function to handle the creation of interactive 2D plots using the quiver functions.
 
     Args:
         fig (Figure): The figure to plot the map in.
-        ax (Axes): The ax to plot the map in
-        cart_axes (list[int]): The two cartesian axes to plot against, with 0 = "x", 1 = "y" and 2 = "z".
+        ax (Axes): The ax to plot the map in.
+        cart_axes (list[int]): The two axes to plot against, with 0 = "x", 1 = "y" and 2 = "z".
         See create_map for how axes not matching the data's own native a1,a2 are handled.
         dataU (xr.DataArray): The x-data to plot.
-        dataV (xr.DataArray): The y-data to plot.
-        template (dict, optional): The template dictionnary contains all the instruction to create the plot. It has the following nested structure:
+        dataV (xr.DataArray): The y-data to plot. It is put through whatever relabelling or
+        interpolation dataU needed, so the two always end up on the same mesh.
+        resolution (int or tuple[int], optional): The resolution to interpolate onto, for a skewed
+        lattice that needs it. Defaults to None.
+        template (dict, optional): As create_map's, plus:
             template
-                ↳ fkwargs: keyword arguments for the plotting function defined by 'method'. default to {}
-                ↳ colorbar:
-                    ↳ kwargs: keyword arguments passed to the Figure.colorbar function. default to {"format":"{x:.1e}"}.
-                    ↳ cax: keyword arguments passed to the AxesDivider.append_axes function. Default to dict(position = 'right', size="5%", pad=0.05).
-                    ↳ ticks: used to set manually the position of the colorbar ticks if necessary. Default to None.
-                    ↳ tickslabel: used to set manually the text of the colorbar ticks if necessary. Default to None.
-                ↳ slider_start: The initial position of the sliders. Default to 'left'.
-                ↳ autoscale: Wheter to autoscale the color range. Default to True.
+                ↳ density: keep every n-th arrow along each axis, to thin a crowded field. Default to 1.
+        Defaults to 'quiver_tmpl()'.
+        cst_bds (bool, optional): Only meaningful on a moving grid, as in create_map. Defaults to False.
 
     Returns:
         tuple[dict, Callable, Axes]: A slider dictionnary, an update function for interactivity and the Axes object.
+
+    Raises:
+        ValueError: If 'cart_axes' does not have exactly two entries.
     """
     if len(cart_axes) != 2:
         raise ValueError("create_quiver needs exactly 2 cart_axes")
 
-    template = deepcopy(template)
-    func = Axes.quiver
+    if template is None:
+        template = quiver_tmpl()
+
+    layout = _prepare(dataU, cart_axes, template, resolution)
+    sliders = layout.sliders
+    template = _prepare_template(template)
     n = template.get("density", 1)
+    # The second field has to make the same journey as the first, or the arrows' two components
+    # end up indexed by different axes
+    dataV = layout.align(dataV)
 
-    spatial_dims = _spatial_dims(dataU)
-    n_dims = len(spatial_dims)
-    dim1, dim2 = coord_names[cart_axes[0]], coord_names[cart_axes[1]]
-
-    moving = bool(_moving_dims(dataU, dim1, spatial_dims))
-    ortho = not moving and (cart_axes != [0, 1] or n_dims != 2)
-    if ortho:
-        dataU = _to_orthogonal(dataU, spatial_dims)
-        dataV = _to_orthogonal(dataV, spatial_dims)
-
-    if moving:
-        plotted_dims = [spatial_dims[d] for d in cart_axes]
-        leftover_spatial = [spatial_dims[d] for d in range(n_dims) if d not in cart_axes]
-    else:
-        plotted_dims = [dim1, dim2] if ortho else spatial_dims
-        leftover_spatial = (
-            [coord_names[d] for d in range(n_dims) if d not in cart_axes] if ortho else []
-        )
-
-    # Creating the sliders objects
-    slider_dims = [dim for dim in dataU.dims if dim not in plotted_dims]
-    sliders = _make_sliders(dataU, slider_dims, leftover_spatial, template)
-
-    mesh_dims = [d for d in dataU.dims if d in plotted_dims]
-
-    def mesh_at(sel: dict) -> tuple[xr.DataArray, xr.DataArray]:
-        """The arrow positions, at one position of the sliders."""
-        out = []
-        for name in (dim1, dim2):
-            coord = dataU.coords[name]
-            coord = coord.sel(
-                {d: v for d, v in sel.items() if d in coord.dims}, method="nearest"
-            )
-            out += [coord.transpose(*mesh_dims) if moving else coord]
-        return out[0], out[1]
-
-    # Creating the fkwargs key just in case, to avoid testing its existence every time
-    if template.get("fkwargs") is None:
-        template["fkwargs"] = {}
-
-    # Initial parameter selections
-    initial_field_sel = {dim: sliders[dim].value for dim in sliders}
-
-    # Extracting the norm object from the template, it is convoluted to avoid unintended sharing of colorscales
-    if template.get("fkwargs"):
-        if template["fkwargs"].get("norm"):
-            template["fkwargs"]["norm"] = (
-                template["fkwargs"]["norm"]()
-                if callable(template["fkwargs"]["norm"])
-                else template["fkwargs"]["norm"]
-            )
-
-    # Shortcut names for the coordinates
-    X, Y = mesh_at(initial_field_sel)
-
-    def subsample(arr):
+    def subsample(arr: xr.DataArray) -> xr.DataArray:
         return arr.isel({d: slice(None, None, n) for d in arr.dims})
 
-    # Initial data selection
-    plot_init_U = dataU.sel(initial_field_sel, method="nearest")
-    plot_init_V = dataV.sel(initial_field_sel, method="nearest")
-    if ortho:
-        plot_init_U = plot_init_U.transpose(dim2, dim1)
-        plot_init_V = plot_init_V.transpose(dim2, dim1)
-    elif moving:
-        plot_init_U = plot_init_U.transpose(*mesh_dims)
-        plot_init_V = plot_init_V.transpose(*mesh_dims)
+    def arrows(sel: dict) -> list[xr.DataArray]:
+        """The positions and components of every arrow, at one position of the sliders."""
+        return [
+            subsample(a)
+            for a in (
+                *layout.mesh_at(sel),
+                layout.field_at(layout.data, sel),
+                layout.field_at(dataV, sel),
+            )
+        ]
 
-    obj = func(
-        ax,
-        subsample(X),
-        subsample(Y),
-        subsample(plot_init_U),
-        subsample(plot_init_V),
-        **template["fkwargs"],
-    )
+    def set_limits(X: xr.DataArray, Y: xr.DataArray):
+        if layout.mode == "moving" and not cst_bds:
+            ax.set_xlim(float(X.min()), float(X.max()))
+            ax.set_ylim(float(Y.min()), float(Y.max()))
 
-    colorbar = template.get("colorbar")
-    if colorbar is not None:
-        if colorbar.get("kwargs") is None:
-            colorbar["kwargs"] = {"format": "{x:.1e}"}
-
-    if colorbar:
-        divider = make_axes_locatable(ax)
-        if colorbar.get("cax") is None:
-            colorbar["cax"] = dict(position="right", size="5%", pad=0.05)
-        cax = divider.append_axes(**colorbar["cax"])
-        cbar = fig.colorbar(
-            obj,
-            cax=cax,
-            **colorbar["kwargs"],
-        )
-        if colorbar.get("tickslabel"):
-            ticks = colorbar.get("ticks", cbar.ax.get_yticks())
-            cbar.set_ticks(ticks)
-            cbar.set_ticklabels(colorbar["tickslabel"])
+    initial_sel = {dim: slider.value for dim, slider in sliders.items()}
+    parts = arrows(initial_sel)
+    obj = Axes.quiver(ax, *parts, **template["fkwargs"])
+    set_limits(parts[0], parts[1])
+    _pin_extent(ax, layout, cst_bds)
+    _add_colorbar(fig, ax, obj, template.get("colorbar"))
+    _apply_axes(ax, template.get("axes"))
 
     def update(**kwargs):
-
         nonlocal obj
         sel = {dim: kwargs[dim] for dim in sliders}
+        parts = arrows(sel)
 
-        field_sel = {dim: value for dim, value in sel.items()}
-
-        new_plot_U = dataU.sel(field_sel, method="nearest")
-        new_plot_V = dataV.sel(field_sel, method="nearest")
-        if ortho:
-            new_plot_U = new_plot_U.transpose(dim2, dim1)
-            new_plot_V = new_plot_V.transpose(dim2, dim1)
-        elif moving:
-            new_plot_U = new_plot_U.transpose(*mesh_dims)
-            new_plot_V = new_plot_V.transpose(*mesh_dims)
-
-        # On a moving grid the arrows sit at new positions as well as carrying new values
-        newX, newY = mesh_at(sel) if moving else (X, Y)
-
-        if hasattr(obj, "collections"):
-            for coll in obj.collections:
-                coll.remove()
-        else:
-            obj.remove()
-
-        obj = func(
-            ax,
-            subsample(newX),
-            subsample(newY),
-            subsample(new_plot_U),
-            subsample(new_plot_V),
-            **template["fkwargs"],
-        )
+        # A quiver carries a position per arrow as well as a value, so there is nothing useful to
+        # update in place: the whole field is rebuilt either way.
+        _remove_artist(obj)
+        obj = Axes.quiver(ax, *parts, **template["fkwargs"])
+        set_limits(parts[0], parts[1])
 
         if template.get("autoscale"):
             obj.autoscale()
@@ -1433,11 +1681,6 @@ def _isosurface_mesh(
         (n_faces, 3) vertex indices, and the (n_vertices,) intensities. All three are empty if the
         level lies outside the field's range, which leaves plotly drawing nothing.
     """
-    # Imported here, not at module scope: scikit-image is only needed for the isosurface
-    # path, and an eager import makes the whole plotting module unimportable without it --
-    # which is a real cost on a compute node where it is not installed.
-    from skimage.measure import marching_cubes
-
     values = field.transpose("x", "y", "z").values
     # The orthogonal grid is a bounding box, so its corners fall outside the lattice and are NaN.
     # marching_cubes cannot handle those, and they would poison every cell they touch: push them
@@ -1448,6 +1691,11 @@ def _isosurface_mesh(
     if not lo < level < hi:
         empty = np.zeros((0, 3))
         return empty, empty.astype(int), np.zeros(0)
+
+    # Imported here, not at module scope: scikit-image is only needed for the isosurface path,
+    # and an eager import makes the whole plotting module unimportable without it -- a real
+    # cost on a compute node where it is not installed (fork commit a9114d7).
+    from skimage.measure import marching_cubes
 
     verts, faces, _, _ = marching_cubes(values, level=level, spacing=spacing)
     verts = verts + np.asarray(origin)
@@ -1484,8 +1732,8 @@ def plot_isosurface(
     Args:
         volume (xr.DataArray): The real field whose level set is drawn, must have exactly 3 spatial
         dims (a1, a2, a3). Pass e.g. np.abs(eigve) for a complex eigenvector. Its cartesian coordinates
-        may move with the parameters, as a rescaling solver's do, in which case each frame is regridded
-        onto its own bounding box as the sliders reach it.
+        may move with the parameters, stored dense or factored (see the 'frames' module), in which case
+        each frame is regridded onto its own bounding box as the sliders reach it.
         
         color (xr.DataArray, optional): The real field painted onto the surface, e.g. np.angle(eigve).
         It is interpolated at the surface's vertices, so it needs neither the same resolution nor the
@@ -1534,11 +1782,7 @@ def plot_isosurface(
     Raises:
         ValueError: If 'volume' isn't 3D, or if either field is complex.
     """
-    # As with marching_cubes above: plotly is needed by this function alone, so importing it
-    # here keeps the rest of the module usable without it.
-    import plotly.graph_objects as go
-
-    spatial_dims = _spatial_dims(volume)
+    spatial_dims = lattice_dims(volume)
     if len(spatial_dims) != 3:
         raise ValueError(
             "plot_isosurface draws a surface in space and so needs a field with exactly 3 spatial "
@@ -1555,7 +1799,11 @@ def plot_isosurface(
     # np.angle drops out of xarray and returns a bare ndarray, and it is the obvious way to get a
     # phase out of a complex eigenvector, so accept that form too by re-attaching the volume's axes
     if color is not None and not isinstance(color, xr.DataArray):
-        color = xr.DataArray(np.asarray(color), coords=volume.coords, dims=volume.dims)
+        # The frame recipe goes along with the coordinates, or a factored frame would be lost here
+        frame_attrs = {k: v for k, v in volume.attrs.items() if k == "cart_factors"}
+        color = xr.DataArray(
+            np.asarray(color), coords=volume.coords, dims=volume.dims, attrs=frame_attrs
+        )
 
     period = (2 * np.pi if cyclic is True else float(cyclic)) if cyclic else None
 
@@ -1599,7 +1847,7 @@ def plot_isosurface(
     # On a moving grid there is no single cartesian grid to interpolate onto: each frame has its own,
     # and that is the whole point, since the surface has to be seen to grow with it. So the regrid is
     # deferred into 'frame' below and redone whenever the sliders land somewhere new.
-    moving = bool(_moving_dims(volume, "x", spatial_dims))
+    moving = bool(moving_dims(volume, "x"))
 
     if moving:
         color = volume if color is None else color
@@ -1608,7 +1856,7 @@ def plot_isosurface(
         color = (
             volume
             if color is None
-            else _to_orthogonal(color, _spatial_dims(color), resolution)
+            else _to_orthogonal(color, lattice_dims(color), resolution)
         )
         # The surface is extracted on the volume's grid, while the color field is only ever sampled at
         # the resulting vertices, so only the former's spacing matters here
@@ -1632,7 +1880,12 @@ def plot_isosurface(
         )
     )
     iso_slider = FloatSlider(
-        value=isovalue, min=0.01, max=0.99, step=0.01, description="isovalue"
+        value=isovalue,
+        min=0.01,
+        max=0.99,
+        step=0.01,
+        description="isovalue",
+        continuous_update=utils.CONTINUOUS_UPDATE,
     )
 
     def select(field: xr.DataArray, kwargs: dict) -> xr.DataArray:
@@ -1652,12 +1905,14 @@ def plot_isosurface(
         if key not in frames:
             if len(frames) >= 4:
                 frames.pop(next(iter(frames)))
-            vol = _to_orthogonal(select(volume, kwargs), spatial_dims, resolution)
+            # Written out frame by frame: the regrid needs this frame's x, y, z as plain
+            # coordinates, and one frame of a factored grid is cheap to rebuild
+            vol = _to_orthogonal(materialize(select(volume, kwargs)), spatial_dims, resolution)
             col = (
                 vol
                 if color is volume
                 else _to_orthogonal(
-                    select(color, kwargs), _spatial_dims(color), resolution
+                    materialize(select(color, kwargs)), lattice_dims(color), resolution
                 )
             )
             frames[key] = (vol, col, *cart_grid(vol))
@@ -1715,11 +1970,13 @@ def plot_isosurface(
             colorbar=dict(title=color.name or "", thickness=15),
         )
 
+    import plotly.graph_objects as go          # as marching_cubes above: needed here alone
+
     fig = go.FigureWidget(data=[go.Mesh3d(**mesh_data(*build(initial)), **style)])
 
     pot_slider = None
     if potential is not None:
-        pot = _to_orthogonal(potential.V, _spatial_dims(potential.V), resolution).real
+        pot = _to_orthogonal(potential.V, lattice_dims(potential.V), resolution).real
         pot_spacing = (
             pot.x.values[1] - pot.x.values[0],
             pot.y.values[1] - pot.y.values[0],
@@ -1727,7 +1984,12 @@ def plot_isosurface(
         )
         pot_origin = (pot.x.values[0], pot.y.values[0], pot.z.values[0])
         pot_slider = FloatSlider(
-            value=0.3, min=0.01, max=0.99, step=0.01, description="V level"
+            value=0.3,
+            min=0.01,
+            max=0.99,
+            step=0.01,
+            description="V level",
+            continuous_update=utils.CONTINUOUS_UPDATE,
         )
         sliders.update(
             create_sliders_from_dims(
@@ -1806,8 +2068,7 @@ def plot_isosurface(
         # looks unchanged. The coordinates span every frame the run went through, so their extremes
         # are the largest one: pinning the scene there is what makes the growth visible.
         for name in ("x", "y", "z"):
-            coord = volume.coords[name]
-            scene[f"{name}axis_range"] = [float(coord.min()), float(coord.max())]
+            scene[f"{name}axis_range"] = list(cart_extent(volume, name))
 
     fig.update_layout(
         scene=scene,
@@ -1833,11 +2094,10 @@ def plot_isosurface(
     if pot_slider is not None:
         controls["Vlevel"] = pot_slider
 
-    out = interactive_output(update, controls)
     # Only the controls are displayed here, the figure is the return value and so is rendered by the
     # notebook as the cell's result, just below them. Putting it in this VBox as well would show it
     # twice, since a FigureWidget handed back from a cell is displayed again.
-    display(VBox(list(controls.values()) + [out]))
+    _show_controls(fig, controls, update)
     return fig
 
 
@@ -1884,7 +2144,7 @@ def _minima_overlay(
 
 def plot_eigenvector(
     plots: list[list[xr.DataArray | NoneType]],
-    potentials: list[list[Potential | NoneType]],
+    potentials: list[list[Potential | xr.DataArray | NoneType]],
     templates: list[list[str | tuple[str | dict | NoneType]]] | NoneType = None,
     quivers: NoneType | list[list[NoneType | tuple[xr.DataArray]]] = None,
     ncontours: int = 3,
@@ -1903,7 +2163,11 @@ def plot_eigenvector(
     Args:
         plots (list[list[xr.DataArray]]): A list of list of eigenvectors xr.DataArrays, each DataArray will be plotted in a separate subplot,
         in a grid-pattern determined by the structure of the list of lists.
-        potentials (list[list[Union[Potential, NoneType]]]): The potentials to be plotted as contour for each plot.
+        potentials (list[list[Union[Potential, xr.DataArray, NoneType]]]): The potential to overlay on each plot, as
+        contours, or as a dashed line on a twin y-axis for a single cart_axis. A Potential is asked for its
+        landscape as seen by that subplot's field, through 'Potential.sample_on': a potential that depends
+        on time follows the field's time slider, and one that can evaluate itself on a moving grid follows
+        that grid. A DataArray is drawn as it is, and None draws no overlay.
         templates (list[list[Union[str,tuple[Union[str, dict]]]]]): A dictionnary containing all the instruction to define each subplot style. the templates can also be strings
         calling predefined templates, such as 'amplitude', 'phase', 'real' and more. see 'get_template' for more informations.
         titles (Union[NoneType, list[list[str]]): The title for each subplot. Default to None.
@@ -1916,14 +2180,14 @@ def plot_eigenvector(
         subplot its own axes list independently. A single axis gives line plots (potential and eigenvector overlaid, styled with
         simple defaults rather than the template system); two axes give the usual pcolormesh/contour/quiver overlay. Any spatial
         axis not selected becomes an extra slider. Defaults to [0, 1].
-        cst_bds (bool, optional): Only useful on a field whose cartesian coordinates move with the parameters,
-        as a rescaling solver's do. True holds the axes at the largest frame the run ever reaches, so that
-        the cloud is seen to grow; False lets them follow the current frame, so the cloud keeps its apparent
-        size and it is the axis labels that change. Defaults to False.
+        cst_bds (bool, optional): Only useful on a field whose cartesian coordinates move with the parameters
+        (see the 'frames' module). True holds the axes at the largest frame the field ever reaches, so that
+        it is seen to grow; False lets them follow the current frame, so the field keeps its apparent size
+        and it is the axis labels that change. Defaults to False.
         show_minima (bool | list[list[bool]], optional): Whether to mark the local minima of each subplot's
         potential, found with 'Potential.find_minima' at the current position of the sliders. Either one value
         for every subplot or a matrix with the same shape as 'plots'. On a map the minima are scattered on the
-        map; on a line plot, on the potential's curve. Only subplots that have a potential and show all of its
+        map; on a line plot, on the potential's curve. Only subplots that have a Potential and show all of its
         space are marked; the others -- a cut through a higher-dimensional landscape, which has no reason to
         contain its minima, or a subplot without a potential -- are skipped, so one True serves a grid that
         mixes maps and cuts. Defaults to False.
@@ -1989,31 +2253,6 @@ def plot_eigenvector(
     funcs: list[Callable] = []
     sliders = {}
 
-    def make_tmpl(template: str | dict) -> dict:
-        """Check wheter template is a string or a dict, and if a str, create the proper dictionnary."""
-        return template if isinstance(template, dict) else cmesh_tmpl(template)
-
-    def format_template(template: tuple[str | dict | NoneType]) -> tuple[dict, dict, dict]:
-        """Format a template input into the proper tuple"""
-        if template is None:
-            template = ({}, {}, {})
-        elif isinstance(template, str):
-            template = (cmesh_tmpl(template), contour_tmpl(ncontours), quiver_tmpl())
-        elif isinstance(template, dict):
-            template = (template, contour_tmpl(ncontours), quiver_tmpl())
-        elif not isinstance(template, tuple):
-            raise ValueError("Each template entry must either be a tuple or a string")
-        elif len(template) == 1:
-            ctmpl = make_tmpl(template[0])
-            template = (ctmpl, contour_tmpl(ncontours), quiver_tmpl())
-        elif len(template) == 2:
-            ctmpl = make_tmpl(template[0])
-            template = (ctmpl, template[1], quiver_tmpl())
-        elif len(template) == 3:
-            ctmpl = make_tmpl(template[0])
-            template = (ctmpl, template[1], template[2])
-        return template
-
     fig, axes = plt.subplots(
         nrows=n_rows,
         ncols=n_cols,
@@ -2034,10 +2273,12 @@ def plot_eigenvector(
     for i in range(n_rows):
         for j in range(n_cols):
             ax = axes[i][j]
-            template = format_template(templates[i][j])
+            template = _format_template(
+                templates[i][j], ({}, contour_tmpl(ncontours), quiver_tmpl())
+            )
 
             plot = plots[i][j]
-            poten = potentials[i][j]
+            layer = _potential_layer(potentials[i][j], plot)
             quiv = quivers[i][j]
             cart_axe = cart_axes[i][j]
             resolution = resolutions[i][j]
@@ -2046,10 +2287,11 @@ def plot_eigenvector(
                 raise ValueError(
                     f"quivers require 2 cart_axes; quiver plots have no 1D analog (cell [{i}][{j}])"
                 )
-            # Minima are only marked where they can be: a subplot with a potential that shows all
-            # of its space. A cut through a higher-dimensional landscape has no reason to contain
-            # its minima, so such subplots (and ones without a potential) are skipped, not refused:
-            # one show_minima=True can then serve a grid that mixes maps and cuts.
+            # Minima are only marked where they can be: a subplot with a Potential that shows all of
+            # its space. A cut through a higher-dimensional landscape has no reason to contain its
+            # minima, so such subplots (and ones without a potential) are skipped, not refused: one
+            # show_minima=True can then serve a grid that mixes maps and cuts.
+            poten = potentials[i][j] if isinstance(potentials[i][j], Potential) else None
             mark_minima = (
                 show_minima[i][j]
                 and poten is not None
@@ -2059,27 +2301,33 @@ def plot_eigenvector(
             if len(cart_axe) == 1:
                 if plot is not None:
                     slids, up, ax = create_line(
-                        fig, ax, cart_axe[0], plot, template[0], cst_bds, resolution
+                        fig,
+                        ax,
+                        cart_axe[0],
+                        plot,
+                        resolution=resolution,
+                        template=template[0],
+                        cst_bds=cst_bds,
                     )
                     sliders.update(slids)
                     funcs += [up]
-                if poten is not None:
+                if layer is not None:
                     # Potential and eigenvector are on very different scales: give the potential its own y-axis
                     ax_pot = ax.twinx()
                     slids, up, ax_pot = create_line(
                         fig,
                         ax_pot,
                         cart_axe[0],
-                        poten.V,
-                        {
+                        layer,
+                        resolution=resolution,
+                        template={
                             "fkwargs": {
                                 "color": "gray",
                                 "linestyle": "dashed",
                                 "linewidth": 1,
                             }
                         },
-                        cst_bds,
-                        resolution
+                        cst_bds=cst_bds,
                     )
                     ax_pot.set_ylabel("Potential", color="gray")
                     ax_pot.tick_params(axis="y", colors="gray")
@@ -2093,55 +2341,63 @@ def plot_eigenvector(
             else:
                 if plot is not None:
                     slids, up, ax = create_map(
-                        fig, ax, cart_axe, plot, "pcolormesh", resolution, template[0], cst_bds
+                        fig,
+                        ax,
+                        cart_axe,
+                        plot,
+                        "pcolormesh",
+                        resolution=resolution,
+                        template=template[0],
+                        cst_bds=cst_bds,
                     )
                     sliders.update(slids)
                     funcs += [up]
-                if poten is not None and template[1] is not None:
+                if layer is not None and template[1] is not None:
                     slids, up, ax = create_map(
-                        fig, ax, cart_axe, poten.V, "contour", resolution, template[1], cst_bds
+                        fig,
+                        ax,
+                        cart_axe,
+                        layer,
+                        "contour",
+                        resolution=resolution,
+                        template=template[1],
+                        cst_bds=cst_bds,
                     )
                     sliders.update(slids)
                     funcs += [up]
-                if poten is not None:
-                    if mark_minima:
-                        funcs += [_minima_overlay(
-                            fig, ax, poten, cart_axe, sliders, minima_kwargs, minima_size,
-                            minima_mode,
-                        )]
+                if mark_minima:
+                    funcs += [_minima_overlay(
+                        fig, ax, poten, cart_axe, sliders, minima_kwargs, minima_size, minima_mode,
+                    )]
                 if quiv is not None:
                     slids, up, ax = create_quiver(
-                        fig, ax, cart_axe, quiv[0], quiv[1], template[2]
+                        fig,
+                        ax,
+                        cart_axe,
+                        quiv[0],
+                        quiv[1],
+                        resolution=resolution,
+                        template=template[2],
+                        cst_bds=cst_bds,
                     )
                     sliders.update(slids)
                     funcs += [up]
 
-            bounds = (
-                plot if plot is not None else (poten.V if poten is not None else None)
-            )
-            # On a moving grid the coordinate spans every frame the run went through, so its extremes
-            # are the largest frame -- which is the box to hold the axes at when cst_bds is set. When
-            # it is not, the create_* update functions reset the limits frame by frame instead. A grid
-            # that does not move has one box either way, so cst_bds does not enter into it.
-            follows_frame = bounds is not None and cst_bds and bool(
-                _moving_dims(bounds, coord_names[cart_axe[0]], _spatial_dims(bounds))
-            )
-            
-            if bounds is not None and follows_frame:
-                co1 = coord_names[cart_axe[0]]
-                ax.set_xlim(np.min(bounds.coords[co1]), np.max(bounds.coords[co1]))
-                if len(cart_axe) == 2:
-                    co2 = coord_names[cart_axe[1]]
-                    ax.set_ylim(np.min(bounds.coords[co2]), np.max(bounds.coords[co2]))
-            if len(cart_axe) == 2:
+            # Equal by default, since a field on a lattice should be drawn in real
+            # proportions, but not when a template has asked for something else: a map over two
+            # parameters has no reason to be square.
+            if len(cart_axe) == 2 and not any(
+                ((layer or {}).get("axes") or {}).get("aspect") for layer in template
+            ):
                 ax.set_aspect("equal")
+            axes[i][j] = ax
+
             geometry = resolve_geometry(lattice[i][j], poten)
             if geometry is not None and sorted(cart_axe) == [0, 1]:
                 # drawn last, over the field and inside the final limits; with a potential that the
                 # map shows whole, the occupied sites are those its minima snap to
                 whole = poten is not None and poten.n_dims == 2
                 overlays.append((ax, geometry, poten if whole else None, list(cart_axe) == [1, 0]))
-            axes[i][j] = ax
 
     start = {d: w.value for d, w in sliders.items()}
     for ax, geometry, poten, swap in overlays:
@@ -2152,9 +2408,7 @@ def plot_eigenvector(
         for f in funcs:
             f(**kwargs)
 
-    out = interactive_output(update, sliders)
-    # Display everything
-    display(VBox(list(sliders.values()) + [out]))
+    _show_controls(fig, sliders, update)
     return fig, axes
 
 

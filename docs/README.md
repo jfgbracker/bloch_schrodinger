@@ -15,4 +15,8 @@ This folder contains the package's Jupyter tutorials. They are meant to be read 
 11. [ExactHubbard.ipynb](ExactHubbard.ipynb) — the exact Hubbard `U` of `bloch_schrodinger.hubbard`, and how it differs from the single-band Wannier estimate.
 12. [Plotting.ipynb](Plotting.ipynb) — the interactive plotting functions (potentials, band structures, eigenvectors and cuts through them, Wannier functions, the lattice geometry drawn schematically), on a honeycomb optical lattice. [Plotting_tutorial.ipynb](Plotting_tutorial.ipynb) is the same with exercises and solutions.
 
+## Reference
+
+- [templates.md](templates.md) — the plotting template cheat sheet: every key, which function reads it, the presets, and how to write your own.
+
 Most tutorials use 2D examples for simplicity, but the package supports 1D, 2D and 3D potentials and solvers throughout (see `nDimensions.ipynb`).

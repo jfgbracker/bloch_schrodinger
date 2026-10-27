@@ -8,9 +8,9 @@ import numpy as np
 import pytest
 import xarray as xr
 
+from bloch_schrodinger.frames import lattice_dims
 from bloch_schrodinger.plotting import (
     _isosurface_mesh,
-    _spatial_dims,
     _to_orthogonal,
     plot_isosurface,
 )
@@ -202,7 +202,7 @@ def test_isosurface_cyclic_colour_does_not_tear_at_the_seam(cyclic, tolerance):
     psi = np.exp(-(x**2 + y**2 + z**2) / 8) * np.exp(1j * k * x)
     phase = xr.ufuncs.angle(psi)
 
-    spatial = _spatial_dims(np.abs(psi))
+    spatial = lattice_dims(np.abs(psi))
     volume = _to_orthogonal(np.abs(psi), spatial)
     period = 2 * np.pi
     # plot_isosurface carries a cyclic field around the unit circle before regridding

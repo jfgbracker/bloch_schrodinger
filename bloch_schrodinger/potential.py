@@ -1143,6 +1143,24 @@ class Potential:
             coords=x.coords,
         )
 
+    def sample_on(self, field: xr.DataArray | None = None) -> xr.DataArray:
+        """The landscape as seen by a field: on the field's lattice, over its parameter space.
+
+        This is the hook through which the plotting functions ask a potential for the layer to draw
+        with a field, so that they never need to know what kind of potential they were handed. A
+        static potential is the same on every frame, so it returns its own landscape and leaves the
+        broadcasting to xarray. Subclasses whose landscape depends on time, or that can evaluate
+        themselves on a grid moving with the field, override it to sample the field's own frames.
+
+        Args:
+            field (xr.DataArray, optional): The field the landscape is drawn with. Unused here.
+            Defaults to None.
+
+        Returns:
+            xr.DataArray: The landscape.
+        """
+        return self.V
+
     def coarsen(self, factor: tuple[int]) -> "Potential":
         """Return a coarsened copy of the Potential, with reduced resolution along all axes.
 
